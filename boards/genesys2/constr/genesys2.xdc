@@ -1,0 +1,32 @@
+# Xilinx Design Constraints (XDC) for Genesys2 board
+# Pin assignments, I/O standards, and timing constraints for Kintex-7 FPGA
+
+# ================================================================
+# CLOCK - 200MHz differential system clock
+# ================================================================
+# Negative clock input
+set_property -dict {PACKAGE_PIN AD11 IOSTANDARD LVDS} [get_ports i_sysclk_n]
+# Positive clock input
+set_property -dict {PACKAGE_PIN AD12 IOSTANDARD LVDS} [get_ports i_sysclk_p]
+# 200MHz = 5ns period
+create_clock -period 5 -name sysclk [get_ports i_sysclk_p]
+
+# ================================================================
+# UART - Serial communication for debug console
+# ================================================================
+# UART transmit
+set_property -dict {PACKAGE_PIN Y23 IOSTANDARD LVCMOS33} [get_ports o_uart_tx]
+# UART receive
+set_property -dict {PACKAGE_PIN Y20 IOSTANDARD LVCMOS33} [get_ports i_uart_rx]
+
+# ================================================================
+# FAN CONTROL - PWM output for FPGA cooling fan
+# ================================================================
+# Fan PWM control
+set_property -dict {PACKAGE_PIN W19 IOSTANDARD LVCMOS33} [get_ports o_fan_pwm]
+
+# ================================================================
+# RESET - Push-button reset (active-low)
+# ================================================================
+# Reset button
+set_property -dict {PACKAGE_PIN R19 IOSTANDARD LVCMOS33} [get_ports i_pb_resetn]

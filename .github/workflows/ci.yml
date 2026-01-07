@@ -1,0 +1,153 @@
+# Copyright 2026 Two Sigma Open Source, LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # Tool versions - single source of truth (also in Dockerfile)
+  VERILATOR_VERSION: "5.044"
+  YOSYS_VERSION: "0.60"
+
+jobs:
+  # Build the Docker image (shared by all jobs)
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and export Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: frost-dev:latest
+          outputs: type=docker,dest=/tmp/frost-dev.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frost-docker-image
+          path: /tmp/frost-dev.tar
+          retention-days: 1
+
+  # Run Cocotb tests with Verilator
+  test-verilator:
+    name: Cocotb Tests (Verilator)
+    runs-on: ubuntu-24.04
+    needs: build-docker
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: frost-docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/frost-dev.tar
+
+      - name: Run Cocotb tests with Verilator
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/workspace frost-dev:latest \
+            pytest tests/ -m cocotb --sim verilator -v
+
+  # Run Cocotb tests with Icarus Verilog
+  test-icarus:
+    name: Cocotb Tests (Icarus)
+    runs-on: ubuntu-24.04
+    needs: build-docker
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: frost-docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/frost-dev.tar
+
+      - name: Run Cocotb tests with Icarus
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/workspace frost-dev:latest \
+            pytest tests/ -m cocotb --sim icarus -v
+
+  # Run Yosys synthesis check
+  test-synthesis:
+    name: Yosys Synthesis Check
+    runs-on: ubuntu-24.04
+    needs: build-docker
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: frost-docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/frost-dev.tar
+
+      - name: Run synthesis tests
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/workspace frost-dev:latest \
+            pytest tests/ -m synthesis -v
+
+  # Run linting (doesn't need Docker - just Python)
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy
+
+      - name: Run Ruff
+        run: ruff check .
+
+      - name: Run Ruff format check
+        run: ruff format --check .

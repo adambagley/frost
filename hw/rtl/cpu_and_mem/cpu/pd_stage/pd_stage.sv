@@ -1,0 +1,134 @@
+/*
+ *    Copyright 2026 Two Sigma Open Source, LLC
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+/*
+  Pre-Decode (PD) Stage - Second stage of the 6-stage RISC-V pipeline.
+
+  This stage performs RVC decompression and instruction selection. The IF stage
+  outputs raw parcel and selection signals; PD performs the actual decompression.
+  This breaks the long combinational path from memory read through decompression
+  to pipeline registers.
+
+  Key operations:
+  - RVC decompression (16-bit to 32-bit instruction expansion)
+  - Instruction selection muxing (NOP, spanning, compressed, or aligned)
+  - Early source register extraction for forwarding/hazard timing
+
+  The decompressed/selected instruction is registered and passed to ID stage,
+  which performs full instruction decoding and immediate extraction.
+
+  Flush is observed here (along with ID stage) during the 2-cycle flush
+  window after branches, traps, or MRET.
+*/
+module pd_stage #(
+    parameter int unsigned XLEN = 32
+) (
+    input logic i_clk,
+    input riscv_pkg::pipeline_ctrl_t i_pipeline_ctrl,
+    input riscv_pkg::from_if_to_pd_t i_from_if_to_pd,
+    output riscv_pkg::from_pd_to_id_t o_from_pd_to_id
+);
+
+  // ===========================================================================
+  // RVC Decompressor
+  // ===========================================================================
+  // Decompress the raw 16-bit parcel from IF stage.
+  // This runs from registered values, giving a full cycle for decompression.
+
+  logic [31:0] decompressed_instr;
+  logic        decomp_is_compressed;
+  logic        decomp_illegal;
+
+  rvc_decompressor decompressor_inst (
+      .i_instr_compressed(i_from_if_to_pd.raw_parcel),
+      .o_instr_expanded(decompressed_instr),
+      .o_is_compressed(decomp_is_compressed),
+      .o_illegal(decomp_illegal)
+  );
+
+  // ===========================================================================
+  // Final Instruction Selection
+  // ===========================================================================
+  // Select final instruction based on selection signals from IF stage.
+  // Selection signals are already registered at IF→PD boundary.
+
+  logic sel_32bit;
+  assign sel_32bit = !i_from_if_to_pd.sel_nop && !i_from_if_to_pd.sel_spanning &&
+                     !i_from_if_to_pd.sel_compressed;
+
+  // One-hot parallel OR mux for minimal depth
+  logic [31:0] final_instruction;
+  assign final_instruction = ({32{i_from_if_to_pd.sel_nop}} & riscv_pkg::NOP) |
+                             ({32{i_from_if_to_pd.sel_spanning}} & i_from_if_to_pd.spanning_instr) |
+                             ({32{i_from_if_to_pd.sel_compressed}} & decompressed_instr) |
+                             ({32{sel_32bit}} & i_from_if_to_pd.effective_instr);
+
+  // ===========================================================================
+  // Early Source Register Extraction (Timing Optimized)
+  // ===========================================================================
+  // Extract source registers in parallel with decompression for forwarding/hazard
+  // detection. This runs from registered values and feeds into registered outputs.
+  //
+  // For compressed instructions, extract from the decompressed instruction output.
+  // For 32-bit instructions, extract from effective_instr (spanning or aligned).
+  // For NOP, source registers are x0.
+  //
+  // This is simpler than the reverted approach that extracted in IF stage because:
+  // 1. We work from registered values (no timing pressure)
+  // 2. We can just extract from the final instruction output
+
+  logic [4:0] source_reg_1;
+  logic [4:0] source_reg_2;
+
+  // Extract from final instruction - bits [19:15] for rs1, bits [24:20] for rs2
+  assign source_reg_1 = final_instruction[19:15];
+  assign source_reg_2 = final_instruction[24:20];
+
+  // ===========================================================================
+  // Pipeline Register: PD → ID
+  // ===========================================================================
+  // Register all outputs to ID stage with stall and flush support.
+
+  always_ff @(posedge i_clk) begin
+    if (i_pipeline_ctrl.reset) begin
+      // On reset, insert NOP into pipeline
+      o_from_pd_to_id.instruction          <= riscv_pkg::NOP;
+      o_from_pd_to_id.program_counter      <= '0;
+      o_from_pd_to_id.link_address         <= '0;
+      o_from_pd_to_id.source_reg_1_early   <= 5'd0;
+      o_from_pd_to_id.source_reg_2_early   <= 5'd0;
+      // Branch prediction metadata
+      o_from_pd_to_id.btb_hit              <= 1'b0;
+      o_from_pd_to_id.btb_predicted_taken  <= 1'b0;
+      o_from_pd_to_id.btb_predicted_target <= '0;
+    end else if (~i_pipeline_ctrl.stall) begin
+      // When flushing, insert NOP; otherwise pass values from decompression
+      o_from_pd_to_id.instruction <= i_pipeline_ctrl.flush ? riscv_pkg::NOP : final_instruction;
+      o_from_pd_to_id.program_counter <= i_from_if_to_pd.program_counter;
+      o_from_pd_to_id.link_address <= i_from_if_to_pd.link_address;
+      // Early source registers for forwarding/hazard timing
+      o_from_pd_to_id.source_reg_1_early <= i_pipeline_ctrl.flush ? 5'd0 : source_reg_1;
+      o_from_pd_to_id.source_reg_2_early <= i_pipeline_ctrl.flush ? 5'd0 : source_reg_2;
+      // Branch prediction metadata - clear on flush (prediction for flushed instr is invalid)
+      o_from_pd_to_id.btb_hit <= i_pipeline_ctrl.flush ? 1'b0 : i_from_if_to_pd.btb_hit;
+      o_from_pd_to_id.btb_predicted_taken <= i_pipeline_ctrl.flush ? 1'b0 :
+                                              i_from_if_to_pd.btb_predicted_taken;
+      o_from_pd_to_id.btb_predicted_target <= i_from_if_to_pd.btb_predicted_target;
+    end
+    // When stalled, hold current values (implicit - no else clause)
+  end
+
+endmodule : pd_stage

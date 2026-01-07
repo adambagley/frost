@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+
+#    Copyright 2026 Two Sigma Open Source, LLC
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+"""Unified runner for cocotb simulations - works with pytest and standalone."""
+
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+# Simulators to test in CI (excluding questa which requires license)
+CI_SIMULATORS = ["icarus", "verilator"]
+
+
+# =============================================================================
+# Test Configuration Registry
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class CocotbRunConfig:
+    """Configuration for a cocotb test run."""
+
+    python_test_module: str
+    hdl_toplevel_module: str
+    app_name: str | None = None  # Application name (compiled on demand)
+    description: str = ""
+
+
+# CPU testbench tests (multiple modules combined)
+CPU_TEST_MODULES = ",".join(
+    [
+        "cocotb_tests.test_cpu",
+        "cocotb_tests.test_directed_atomics",
+        "cocotb_tests.test_directed_traps",
+        "cocotb_tests.test_compressed",
+    ]
+)
+
+# Registry of all available tests - single source of truth
+# Maps test name to its configuration
+TEST_REGISTRY: dict[str, CocotbRunConfig] = {
+    "cpu": CocotbRunConfig(
+        python_test_module=CPU_TEST_MODULES,
+        hdl_toplevel_module="cpu_tb",
+        description="CPU random regression and directed tests",
+    ),
+    # Real program tests - all use same module/toplevel, differ only in app
+    "branch_pred_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="branch_pred_test",
+        description="Branch prediction test",
+    ),
+    "c_ext_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="c_ext_test",
+        description="C extension test",
+    ),
+    "call_stress": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="call_stress",
+        description="Call stress test",
+    ),
+    "coremark": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="coremark",
+        description="Coremark benchmark",
+    ),
+    "csr_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="csr_test",
+        description="CSR test",
+    ),
+    "freertos_demo": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="freertos_demo",
+        description="FreeRTOS demo",
+    ),
+    "hello_world": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="hello_world",
+        description="Hello World program",
+    ),
+    "isa_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="isa_test",
+        description="ISA compliance test suite",
+    ),
+    "memory_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="memory_test",
+        description="Memory allocator test suite",
+    ),
+    "packet_parser": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="packet_parser",
+        description="Packet parser test",
+    ),
+    "print_clock_speed": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="print_clock_speed",
+        description="Print clock speed test",
+    ),
+    "spanning_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="spanning_test",
+        description="Spanning instruction test",
+    ),
+    "strings_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="strings_test",
+        description="String library test suite",
+    ),
+    # Note: uart_echo is intentionally excluded - it requires interactive user
+    # input and has no <<PASS>> marker, so it cannot be tested automatically.
+}
+
+# List of real program test names (excludes 'cpu' which uses different toplevel)
+REAL_PROGRAM_TESTS = [name for name in TEST_REGISTRY if name != "cpu"]
+
+
+# =============================================================================
+# CocotbRunner Class
+# =============================================================================
+
+
+class CocotbRunner:
+    """Run Cocotb (Coroutine-based Cosimulation TestBench) simulations.
+
+    Manages simulator setup, environment configuration, and test execution
+    for FROST CPU verification using Cocotb Python testbench.
+    """
+
+    def __init__(
+        self,
+        python_test_module: str,
+        hdl_toplevel_module: str,
+        app_name: str | None = None,
+    ) -> None:
+        """Initialize Cocotb test runner.
+
+        Args:
+            python_test_module: Python module containing Cocotb tests (e.g., "cocotb_tests.test_cpu")
+            hdl_toplevel_module: Top-level HDL module name (e.g., "cpu_tb")
+            app_name: Optional application name to compile and load (e.g., "hello_world")
+        """
+        self.python_test_module = python_test_module
+        self.hdl_toplevel_module = hdl_toplevel_module
+        self.app_name = app_name
+        self.test_directory = Path(__file__).parent.resolve()
+        self.repository_root_directory = self.test_directory.parent
+
+    @classmethod
+    def from_config(cls, config: CocotbRunConfig) -> "CocotbRunner":
+        """Create a CocotbRunner from a CocotbRunConfig."""
+        return cls(
+            python_test_module=config.python_test_module,
+            hdl_toplevel_module=config.hdl_toplevel_module,
+            app_name=config.app_name,
+        )
+
+    def _compile_app(self) -> bool:
+        """Compile the application if app_name is set.
+
+        Returns:
+            True if compilation succeeded or no app to compile, False on failure.
+        """
+        if not self.app_name:
+            return True
+
+        # Import compile_app from sw/apps directory
+        apps_dir = self.repository_root_directory / "sw" / "apps"
+        sys.path.insert(0, str(apps_dir))
+        try:
+            from compile_app import compile_app
+
+            return compile_app(self.app_name, verbose=True)
+        finally:
+            sys.path.pop(0)
+
+    def _get_program_memory_file(self) -> str | None:
+        """Get the path to the program memory file for the current app."""
+        if not self.app_name:
+            return None
+        return f"../sw/apps/{self.app_name}/sw.mem"
+
+    def setup_environment(self) -> dict[str, str]:
+        """Set up environment variables for HDL simulation.
+
+        Returns:
+            Dictionary of environment variables for subprocess
+        """
+        environment_variables = os.environ.copy()
+
+        # Select HDL simulator (icarus or verilator)
+        simulator_name = environment_variables.get("SIM", "icarus")
+        if simulator_name == "":
+            simulator_name = "icarus"
+
+        # GUI mode flag (0 = batch, 1 = interactive waveform viewer)
+        gui_mode = environment_variables.get("GUI", "0")
+        if gui_mode == "":
+            gui_mode = "0"
+
+        environment_variables["SIM"] = simulator_name
+        environment_variables["GUI"] = gui_mode
+        environment_variables["ROOT"] = str(self.repository_root_directory)
+
+        # Add verification infrastructure to Python path so cocotb_tests modules are importable
+        verif_path = str(self.repository_root_directory / "verif")
+        current_pythonpath = environment_variables.get("PYTHONPATH", "")
+        if verif_path not in current_pythonpath:
+            current_pythonpath = verif_path + ":" + current_pythonpath
+        environment_variables["PYTHONPATH"] = current_pythonpath
+
+        return environment_variables
+
+    def check_for_failures(
+        self, simulation_result: subprocess.CompletedProcess[str]
+    ) -> bool:
+        """Check if Cocotb reported any test failures.
+
+        Args:
+            simulation_result: Completed subprocess from simulation run
+
+        Returns:
+            True if test failures detected, False otherwise
+        """
+        # First check return code - non-zero indicates failure
+        if simulation_result.returncode != 0:
+            return True
+
+        # If output wasn't captured (standalone mode), trust the return code
+        has_captured_output = (
+            simulation_result.stdout is not None
+            and simulation_result.stderr is not None
+        )
+        if not has_captured_output:
+            return False
+
+        # Check for Cocotb failure indicators in output
+        failure_indicator_strings = [
+            "FAILED",
+            "ERROR",
+            "Test Failed:",
+            "AssertionError",
+            "** TEST FAILED **",
+            "FAIL:",
+            "failed:",
+        ]
+
+        combined_output = (simulation_result.stdout or "") + (
+            simulation_result.stderr or ""
+        )
+        for failure_indicator in failure_indicator_strings:
+            if failure_indicator in combined_output:
+                # Verify it's an actual test failure, not just in a file path
+                output_lines = combined_output.splitlines()
+                for line in output_lines:
+                    if failure_indicator in line and (
+                        "test" in line.lower()
+                        or "fail" in line.lower()
+                        or "error" in line.lower()
+                    ):
+                        return True
+
+        # Check for cocotb summary line showing failures
+        if "passed=0" in combined_output or "failed=" in combined_output:
+            # Look for failed=N where N > 0
+            match = re.search(r"failed=(\d+)", combined_output)
+            if match and int(match.group(1)) > 0:
+                return True
+
+        return False
+
+    def _verilator_needs_rebuild(self) -> bool:
+        """Check if Verilator needs a full rebuild due to toplevel change.
+
+        Returns:
+            True if rebuild needed (toplevel changed), False for incremental build.
+        """
+        sim_build_dir = self.test_directory / "sim_build"
+        toplevel_marker = sim_build_dir / ".last_toplevel"
+        verilator_binary = sim_build_dir / "Vtop"
+
+        # If sim_build exists with a binary but no marker, force rebuild
+        # (this handles stale state from before marker tracking was added)
+        if verilator_binary.exists() and not toplevel_marker.exists():
+            return True
+
+        if not toplevel_marker.exists():
+            return False  # No previous build, let make handle it
+
+        try:
+            last_toplevel = toplevel_marker.read_text().strip()
+            return last_toplevel != self.hdl_toplevel_module
+        except OSError:
+            return False
+
+    def _update_verilator_toplevel_marker(self) -> None:
+        """Record the current toplevel for future incremental build checks."""
+        sim_build_dir = self.test_directory / "sim_build"
+        sim_build_dir.mkdir(exist_ok=True)
+        toplevel_marker = sim_build_dir / ".last_toplevel"
+        toplevel_marker.write_text(self.hdl_toplevel_module)
+
+    def run_simulation(
+        self, check: bool = True, capture_output: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the cocotb simulation."""
+        # Compile the application first if needed
+        if self.app_name and not self._compile_app():
+            raise RuntimeError(f"Failed to compile application: {self.app_name}")
+
+        original_dir = os.getcwd()
+        os.chdir(self.test_directory)
+        env = self.setup_environment()
+
+        try:
+            # For Verilator, skip clean to enable incremental builds when RTL unchanged.
+            # However, if the toplevel module changed, we must rebuild.
+            # For other simulators, always clean to ensure fresh state.
+            simulator = env.get("SIM", "icarus")
+            needs_clean = simulator != "verilator" or self._verilator_needs_rebuild()
+
+            if needs_clean:
+                subprocess.run(["make", "clean"], check=True)
+
+            # Set up program memory symlink if needed
+            program_memory_file = self._get_program_memory_file()
+            if program_memory_file:
+                sw_mem_path = Path("sw.mem")
+                if sw_mem_path.exists() or sw_mem_path.is_symlink():
+                    sw_mem_path.unlink()
+                sw_mem_path.symlink_to(program_memory_file)
+
+            # Run the simulation
+            # Explicitly export PYTHONPATH so it's available to child processes (simulator)
+            pythonpath = env.get("PYTHONPATH", "")
+            cmd = f"export PYTHONPATH='{pythonpath}' && make MODULE={self.python_test_module} TOPLEVEL={self.hdl_toplevel_module}"
+
+            if capture_output:
+                result = subprocess.run(
+                    ["bash", "-c", cmd],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=check,
+                )
+            else:
+                # Let output stream directly to console
+                result = subprocess.run(
+                    ["bash", "-c", cmd],
+                    env=env,
+                    check=check,
+                    text=True,
+                    stdout=None,  # Don't capture, let it stream to terminal
+                    stderr=None,  # Don't capture, let it stream to terminal
+                )
+
+            # For Verilator, update the toplevel marker only after successful build.
+            # This ensures we don't mark a toplevel as built if compilation failed.
+            if simulator == "verilator" and result.returncode == 0:
+                self._update_verilator_toplevel_marker()
+
+            return result
+
+        finally:
+            # Clean up
+            if self.app_name:
+                sw_mem_path = Path("sw.mem")
+                if sw_mem_path.exists() or sw_mem_path.is_symlink():
+                    sw_mem_path.unlink()
+            os.chdir(original_dir)
+
+
+# =============================================================================
+# Helper function for running tests
+# =============================================================================
+
+
+def run_test_with_simulator(
+    test_name: str, simulator: str, capsys: Any | None = None
+) -> None:
+    """Run a test with the specified simulator.
+
+    Args:
+        test_name: Name of the test from TEST_REGISTRY
+        simulator: Simulator to use ("icarus", "verilator", "questa")
+        capsys: Optional pytest capsys fixture for output control
+
+    Raises:
+        pytest.fail: If the test fails
+        KeyError: If test_name is not in TEST_REGISTRY
+    """
+    os.environ["SIM"] = simulator
+    config = TEST_REGISTRY[test_name]
+    runner = CocotbRunner.from_config(config)
+
+    if capsys is not None:
+        with capsys.disabled():
+            print(f"\nRunning {test_name} with {simulator} simulator...")
+            result = runner.run_simulation(check=False, capture_output=False)
+    else:
+        print(f"\nRunning {test_name} with {simulator} simulator...")
+        result = runner.run_simulation(check=False, capture_output=False)
+
+    if runner.check_for_failures(result):
+        pytest.fail(f"Cocotb test failed with {simulator}. Check output for details.")
+
+
+# =============================================================================
+# Pytest Test Classes
+# =============================================================================
+
+
+@pytest.mark.cocotb
+class TestCPU:
+    """Test cases for RISC-V CPU core (random regression + directed tests)."""
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("simulator", CI_SIMULATORS)
+    def test_cpu(self, simulator: str, capsys: Any) -> None:
+        """Run the CPU test through cocotb with different simulators."""
+        run_test_with_simulator("cpu", simulator, capsys)
+
+
+@pytest.mark.cocotb
+class TestRealPrograms:
+    """Test cases for running real programs on the CPU.
+
+    All real program tests use the same test module and toplevel,
+    differing only in which program memory file is loaded.
+    """
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("simulator", CI_SIMULATORS)
+    @pytest.mark.parametrize("test_name", REAL_PROGRAM_TESTS)
+    def test_real_program(self, test_name: str, simulator: str, capsys: Any) -> None:
+        """Run a real program test through cocotb.
+
+        This parametrized test replaces 14 nearly-identical test methods.
+        Pytest will generate test IDs like:
+            test_real_program[hello_world-icarus]
+            test_real_program[coremark-verilator]
+        """
+        run_test_with_simulator(test_name, simulator, capsys)
+
+
+# =============================================================================
+# Command-line Interface
+# =============================================================================
+
+
+def main() -> None:
+    """Run cocotb simulation from command line."""
+    import argparse
+
+    # Build choices list from registry
+    test_choices = sorted(TEST_REGISTRY.keys())
+
+    parser = argparse.ArgumentParser(
+        description="Run cocotb simulations for Frost RISC-V CPU",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s cpu                    # Run CPU test with default simulator (icarus)
+  %(prog)s hello_world --sim=verilator  # Run Hello World with Verilator
+  %(prog)s isa_test --sim=icarus  # Run ISA compliance tests
+  %(prog)s coremark --sim=questa --gui  # Run Coremark with Questa in GUI mode
+
+Note: GUI mode only works with questa simulator.
+
+Available tests:
+"""
+        + "\n".join(
+            f"  {name:20} - {cfg.description}" for name, cfg in TEST_REGISTRY.items()
+        ),
+    )
+    parser.add_argument(
+        "test",
+        choices=test_choices,
+        help="Which test to run",
+    )
+    parser.add_argument(
+        "--sim",
+        default="icarus",
+        choices=["icarus", "verilator", "questa"],
+        help="Simulator to use (default: icarus)",
+    )
+    parser.add_argument(
+        "--gui", action="store_true", help="Enable GUI mode (questa only)"
+    )
+    parser.add_argument(
+        "--testcase",
+        default=None,
+        help="Specific cocotb test function to run (sets TESTCASE env var)",
+    )
+    parser.add_argument(
+        "--random-seed",
+        default=None,
+        help="Random seed for reproducibility (sets RANDOM_SEED env var)",
+    )
+
+    args = parser.parse_args()
+
+    # Set environment based on args
+    os.environ["SIM"] = args.sim
+    os.environ["GUI"] = "1" if args.gui else "0"
+    if args.testcase:
+        os.environ["TESTCASE"] = args.testcase
+    if args.random_seed:
+        os.environ["RANDOM_SEED"] = args.random_seed
+
+    # Get test configuration from registry
+    config = TEST_REGISTRY[args.test]
+    runner = CocotbRunner.from_config(config)
+
+    # Run simulation
+    result = runner.run_simulation(check=False, capture_output=False)
+
+    if runner.check_for_failures(result):
+        print("\nSimulation FAILED! Check output above for details.")
+        sys.exit(1)
+    else:
+        print("\nSimulation completed successfully!")
+
+
+if __name__ == "__main__":
+    main()

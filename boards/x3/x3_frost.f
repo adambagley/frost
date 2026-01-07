@@ -1,0 +1,11 @@
+# X3 board top-level file list
+# Includes FROST core plus X3-specific clock generation and JTAG interface
+
+# FROST RISC-V processor core and all submodules
+-f $(ROOT)/hw/rtl/frost.f
+
+# Common Xilinx FROST subsystem (JTAG, BRAM controller, CPU)
+$(ROOT)/boards/xilinx_frost_subsystem.sv
+
+# X3 board wrapper with UltraScale+ FPGA primitives
+$(ROOT)/boards/x3/x3_frost.sv

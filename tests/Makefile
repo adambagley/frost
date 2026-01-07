@@ -1,0 +1,95 @@
+#    Copyright 2026 Two Sigma Open Source, LLC
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+# Makefile for FROST CPU Cocotb verification tests
+# Configures Verilator/Icarus simulation with Cocotb Python testbench
+
+# Simulation configuration:
+# Simulator choice (verilator or icarus or questa)
+SIM             ?= verilator
+# HDL language (verilog or vhdl)
+TOPLEVEL_LANG   ?= verilog
+# Top-level module name for simulation
+TOPLEVEL        ?= cpu_tb
+# Python test module to run
+MODULE          ?= cocotb_tests.test_cpu
+# Git repository root (with fallback for Docker/non-git contexts)
+ROOT            ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo /workspace)
+# Whether to generate a waveform file
+WAVES           ?= 0
+
+# Export variables for Cocotb
+export TOPLEVEL MODULE TOPLEVEL_LANG SIM ROOT
+
+# Timer speedup for simulation (1000x faster than real-time)
+# This makes FreeRTOS and timer-based tests complete much faster in simulation
+# Default is 1000 for simulation; set to 1 for synthesis
+SIM_TIMER_SPEEDUP ?= 1000
+
+# Compilation arguments - RTL file list
+COMPILE_ARGS := \
+        -f $(ROOT)/hw/rtl/frost.f \
+
+# Conditional Verilog sources based on toplevel module
+ifeq ($(TOPLEVEL),cpu_tb)
+VERILOG_SOURCES := \
+        $(ROOT)/hw/sim/cpu_tb.sv  # Include testbench wrapper
+else
+# For frost toplevel with Questa, need to set top-level file (Questa skips vlog if empty)
+# For Verilator/Icarus, frost.sv is already in frost.f so we don't add it again
+ifeq ($(SIM),questa)
+VERILOG_SOURCES := \
+        $(ROOT)/hw/rtl/frost.sv
+else
+VERILOG_SOURCES :=
+endif
+endif
+
+export VERILOG_SOURCES
+
+# Add verification infrastructure to Python path so cocotb_tests modules are importable
+export PYTHONPATH := $(ROOT)/verif:$(PYTHONPATH)
+
+# Detect number of CPU cores for parallel compilation
+NUMBER_OF_CPU_CORES := $(shell nproc)
+
+# Simulator-specific options
+ifeq ($(SIM),verilator)
+	# Verilator threading configuration:
+	# - Runtime: Single-threaded for optimal cocotb performance (avoids VPI overhead)
+	# - Build/Verilation: Multi-threaded for faster compilation
+	#
+	# VERILATOR_THREADS controls runtime threads (1 = single-threaded simulation)
+	# -j flag during verilation enables parallel HDL-to-C++ conversion
+	# VERILATOR_MAKE_FLAGS controls C++ compilation parallelism
+	export VERILATOR_THREADS := 1
+	export VERILATOR_MAKE_FLAGS := -j$(NUMBER_OF_CPU_CORES)
+
+	# Extra verilator args: parallel verilation + optional waveforms
+	ifeq ($(WAVES),1)
+		export EXTRA_ARGS := -j $(NUMBER_OF_CPU_CORES) --trace-fst --trace-structs
+	else
+		export EXTRA_ARGS := -j $(NUMBER_OF_CPU_CORES)
+	endif
+endif
+
+# Include Cocotb simulation makefile rules
+include $(shell cocotb-config --makefiles)/Makefile.sim
+
+# Add custom clean target
+clean:: clean-local
+
+.PHONY: clean-local
+clean-local:
+	@rm -rf dump.vcd dump.fst sw.mem results.xml sim_build

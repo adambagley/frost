@@ -1,0 +1,102 @@
+# Copyright 2026 Two Sigma Open Source, LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+repos:
+  # Python - Ruff linter and formatter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Python - Type checking with mypy
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        additional_dependencies: [pytest, cocotb]
+        args: [--config-file=pyproject.toml]
+        pass_filenames: false
+        entry: mypy verif tests
+
+  # C/C++ - clang-format
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.6
+    hooks:
+      - id: clang-format
+        types_or: [c, c++]
+        exclude: |
+          (?x)^(
+            sw/FreeRTOS-Kernel/.*|
+            sw/apps/coremark/coremark/.*
+          )$
+
+  # C/C++ - clang-tidy (uses wrapper script to set RISC-V target and include paths)
+  - repo: local
+    hooks:
+      - id: clang-tidy
+        name: clang-tidy
+        entry: python3 ./scripts/run-clang-tidy.py
+        language: system
+        types_or: [c, c++]
+        exclude: |
+          (?x)^(
+            sw/FreeRTOS-Kernel/.*|
+            sw/apps/coremark/coremark/.*
+          )$
+
+  # SystemVerilog/Verilog - Verible formatter and linter
+  - repo: local
+    hooks:
+      - id: verible-format
+        name: verible-verilog-format
+        entry: verible-verilog-format
+        language: system
+        files: \.(sv|v|svh|vh)$
+        args: [--inplace]
+        exclude: |
+          (?x)^(
+            hw/third_party/.*
+          )$
+
+      - id: verible-lint
+        name: verible-verilog-lint
+        entry: verible-verilog-lint
+        language: system
+        files: \.(sv|v|svh|vh)$
+        args: [--rules_config_search]
+        exclude: |
+          (?x)^(
+            hw/third_party/.*
+          )$
+
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: |
+          (?x)^(
+            sw/FreeRTOS-Kernel/.*|
+            sw/apps/coremark/coremark/.*
+          )$
+      - id: end-of-file-fixer
+        exclude: |
+          (?x)^(
+            sw/FreeRTOS-Kernel/.*|
+            sw/apps/coremark/coremark/.*
+          )$
+      - id: check-yaml
+      - id: check-added-large-files

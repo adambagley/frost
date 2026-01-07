@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+#build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+#lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Simulation artifacts
+sim_build/
+results.xml
+*.vcd
+*.fst
+dump.vcd
+dump.fst
+
+# Build artifacts
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+
+# Compiled software (regenerated on demand by test/build/load scripts)
+sw.mem
+sw.txt
+sw/apps/*/sw.S
+
+# mypy
+.mypy_cache/
+
+# Vivado
+*.jou
+*.log
+*.txt
+*.str
+.Xil/
+fpga/build/*/work

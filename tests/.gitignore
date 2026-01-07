@@ -1,0 +1,5 @@
+sw.mem
+modelsim.ini
+transcript
+sim_build/
+results.xml
