@@ -87,12 +87,15 @@ module amo_unit #(
     input logic i_rst,
     input logic i_stall,
 
+    // Early detection when AMO is in EX stage (for rs2 capture)
+    input logic            i_amo_in_ex,  // True when AMO (not LR/SC) is in EX stage
+    input logic [XLEN-1:0] i_rs2_fwd,    // Forwarded rs2 value from EX stage
+
     // From EX→MA pipeline register
     input logic i_is_amo_instruction,
     input logic i_is_lr,
     input logic i_is_sc,
     input riscv_pkg::instr_op_e i_instruction_operation,
-    input logic [XLEN-1:0] i_rs2_value,
     input logic [XLEN-1:0] i_data_memory_address,
 
     // Memory read data (arrives 1 cycle after address)
@@ -121,6 +124,10 @@ module amo_unit #(
   logic [XLEN-1:0] captured_old_value;
   logic [XLEN-1:0] captured_address;
   riscv_pkg::instr_op_e captured_operation;
+
+  // Early-captured rs2: captured when AMO is in EX (one cycle before state machine starts)
+  // This ensures we get the correctly forwarded value before pipeline register updates.
+  logic [XLEN-1:0] rs2_early_captured;
 
   // Track whether current AMO instruction has been processed to prevent re-execution
   // This is needed because from_ex_to_ma holds its value during stalls, and without
@@ -180,10 +187,23 @@ module amo_unit #(
     end
   end
 
+  // Early-capture rs2 when AMO is in EX stage (before it enters MA).
+  // This captures the forwarded rs2 value at the correct time, avoiding
+  // timing issues with pipeline register updates at clock edges.
+  always_ff @(posedge i_clk) begin
+    if (i_rst) begin
+      rs2_early_captured <= '0;
+    end else if (i_amo_in_ex && !i_stall) begin
+      // Capture forwarded rs2 when AMO is in EX (will enter MA next cycle)
+      rs2_early_captured <= i_rs2_fwd;
+    end
+  end
+
   // Capture values when AMO starts (only if not already processed)
   always_ff @(posedge i_clk) begin
     if (amo_state == AMO_IDLE && is_regular_amo && !i_stall && !amo_instruction_processed) begin
-      captured_rs2_value <= i_rs2_value;
+      // Use the early-captured rs2 value instead of i_rs2_value
+      captured_rs2_value <= rs2_early_captured;
       captured_address   <= i_data_memory_address;
       captured_operation <= i_instruction_operation;
     end

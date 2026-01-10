@@ -143,12 +143,24 @@ module cache_write_controller #(
   logic cache_write_enable_from_amo;
   assign cache_write_enable_from_amo = i_amo.write_enable & ~is_memory_mapped_io_amo;
 
+  // Track previous cycle's AMO write enable to block stale load writes.
+  // When AMO stall ends, the frozen load write enable would fire on the same
+  // cycle. This register allows us to block the load write for one cycle
+  // after AMO completes.
+  logic amo_write_enable_prev;
+  always_ff @(posedge i_clk)
+    if (i_rst) amo_write_enable_prev <= 1'b0;
+    else amo_write_enable_prev <= i_amo.write_enable;
+
   // ===========================================================================
   // Combined Write Enable and Byte Enable
   // ===========================================================================
+  // Block load write on the cycle immediately after AMO write to prevent
+  // stale load data (frozen during AMO stall) from overwriting AMO result.
   assign o_cache_write_enable = cache_write_enable_from_store ||
                                 cache_write_enable_from_amo ||
-                                (cache_write_enable_from_load && i_unallocated_address_bits_zero);
+                                (cache_write_enable_from_load && i_unallocated_address_bits_zero &&
+                                 ~amo_write_enable_prev);
 
   // For stores, use EX stage per-byte write enables; for loads and AMOs, write all bytes
   assign o_cache_byte_write_enable = cache_write_enable_from_store ?

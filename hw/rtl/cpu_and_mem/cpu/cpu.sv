@@ -319,17 +319,26 @@ module cpu #(
     Handles read-modify-write operations for AMO instructions.
     Stalls pipeline during atomic operation and drives memory write.
   */
+  // Early AMO detection: true when a regular AMO (not LR/SC) is in EX stage.
+  // This allows the AMO unit to capture forwarded rs2 one cycle before entering MA.
+  logic amo_in_ex;
+  assign amo_in_ex = from_id_to_ex.is_amo_instruction &&
+                     !from_id_to_ex.is_lr && !from_id_to_ex.is_sc;
+
   amo_unit #(
       .XLEN(XLEN)
   ) amo_unit_inst (
       .i_clk,
       .i_rst,
       .i_stall(stall_excluding_amo),  // Use external stalls only to avoid combinational loop
+      // Early detection for rs2 capture timing
+      .i_amo_in_ex(amo_in_ex),
+      .i_rs2_fwd(fwd_to_ex.source_reg_2_value),
+      // From EX→MA pipeline register
       .i_is_amo_instruction(from_ex_to_ma.is_amo_instruction),
       .i_is_lr(from_ex_to_ma.is_lr),
       .i_is_sc(from_ex_to_ma.is_sc),
       .i_instruction_operation(from_ex_to_ma.instruction_operation),
-      .i_rs2_value(from_ex_to_ma.rs2_value),
       .i_data_memory_address(from_ex_to_ma.data_memory_address),
       .i_data_memory_read_data(from_ma_comb.data_memory_read_data),
       .o_stall_for_amo(amo_stall_for_amo),
