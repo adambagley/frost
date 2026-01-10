@@ -128,26 +128,25 @@ jobs:
           docker run --rm -v ${{ github.workspace }}:/workspace frost-dev:latest \
             pytest tests/ -m synthesis -v
 
-  # Run linting (doesn't need Docker - just Python)
+  # Run linting inside Docker to ensure version consistency with pre-commit
   lint:
     name: Lint
     runs-on: ubuntu-24.04
+    needs: build-docker
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
+          name: frost-docker-image
+          path: /tmp
 
-      - name: Install Python dependencies
+      - name: Load Docker image
+        run: docker load --input /tmp/frost-dev.tar
+
+      - name: Run pre-commit hooks
         run: |
-          python -m pip install --upgrade pip
-          pip install ruff mypy
-
-      - name: Run Ruff
-        run: ruff check .
-
-      - name: Run Ruff format check
-        run: ruff format --check .
+          docker run --rm -v ${{ github.workspace }}:/workspace frost-dev:latest \
+            pre-commit run --all-files
