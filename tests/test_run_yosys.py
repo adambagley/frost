@@ -28,6 +28,26 @@ from typing import Any
 import pytest
 
 
+def _compile_hello_world(root_dir: Path) -> bool:
+    """Compile hello_world application for synthesis.
+
+    Args:
+        root_dir: Path to the repository root directory
+
+    Returns:
+        True if compilation succeeded, False on failure.
+    """
+    # Import compile_app from sw/apps directory
+    apps_dir = root_dir / "sw" / "apps"
+    sys.path.insert(0, str(apps_dir))
+    try:
+        from compile_app import compile_app
+
+        return compile_app("hello_world", verbose=True)
+    finally:
+        sys.path.pop(0)
+
+
 # Synthesis targets for pytest runs
 # Additional targets can be run manually: ./test_run_yosys.py --target <name>
 SYNTHESIS_TARGETS = [
@@ -51,14 +71,17 @@ class YosysRunner:
         self.setup_sw_mem()
 
     def setup_sw_mem(self) -> None:
-        """Set up sw.mem symlink for synthesis."""
+        """Compile hello_world and set up sw.mem symlink for synthesis."""
+        # Compile hello_world to ensure sw.mem exists
+        if not _compile_hello_world(self.root_dir):
+            raise RuntimeError("Failed to compile hello_world for synthesis")
+
         sw_mem_target = self.root_dir / "sw" / "apps" / "hello_world" / "sw.mem"
         sw_mem_link = self.test_dir / "sw.mem"
 
-        if sw_mem_target.exists():
-            if sw_mem_link.exists() or sw_mem_link.is_symlink():
-                sw_mem_link.unlink()
-            sw_mem_link.symlink_to(sw_mem_target)
+        if sw_mem_link.exists() or sw_mem_link.is_symlink():
+            sw_mem_link.unlink()
+        sw_mem_link.symlink_to(sw_mem_target)
 
     def parse_filelist(self, filelist_path: Path) -> list[str]:
         """Parse a filelist file and return list of Verilog files."""

@@ -17,8 +17,8 @@
 """Compile a FROST software application.
 
 This module provides a function to compile applications in sw/apps/.
-Used by test_run_cocotb.py, load_software.py, and build.py to ensure
-binaries are always up-to-date before simulation, FPGA loading, or synthesis.
+Used by test_run_cocotb.py, test_run_yosys.py, load_software.py, and build.py
+to ensure binaries are always up-to-date before simulation, synthesis, or FPGA loading.
 """
 
 import os
