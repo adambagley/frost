@@ -126,7 +126,7 @@ The Docker image includes:
 - Cocotb and Python dependencies
 - Pre-commit with all linters (clang-format, clang-tidy, Verible, ruff, mypy)
 
-### Setting Up Pre-commit Hooks
+## Setting Up Pre-commit Hooks
 
 Pre-commit hooks run automatically on `git commit` to check code quality:
 
