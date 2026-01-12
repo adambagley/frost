@@ -52,7 +52,9 @@ def _compile_hello_world(root_dir: Path) -> bool:
 # Additional targets can be run manually: ./test_run_yosys.py --target <name>
 SYNTHESIS_TARGETS = [
     ("generic", "synth", "Generic/ASIC (technology-independent)"),
-    ("xilinx", "synth_xilinx", "Xilinx 7-series and UltraScale"),
+    ("xilinx_7series", "synth_xilinx -family xc7", "Xilinx 7-series"),
+    ("xilinx_ultrascale", "synth_xilinx -family xcu", "Xilinx UltraScale"),
+    ("xilinx_ultrascale_plus", "synth_xilinx -family xcup", "Xilinx UltraScale+"),
 ]
 
 

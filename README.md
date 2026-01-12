@@ -13,7 +13,7 @@ There are many RISC-V cores. Here's what makes FROST different:
 - **Practical performance** — 1.62 CoreMark/MHz (523 CoreMark at 322 MHz on UltraScale+) with branch prediction, L0 cache, and full data forwarding.
 - **Layered verification** — constrained-random tests, directed tests, and real C programs all run in Cocotb simulation with pass/fail markers. Bugs that slip past one layer get caught by another. More accessible than SystemVerilog/UVM.
 - **Real workloads included** — FreeRTOS demo, CoreMark benchmark, and ISA compliance suite all run in simulation and on hardware.
-- **No vendor primitives** — pure portable RTL that works on any target. Synthesis tested via Yosys for generic (ASIC) and Xilinx. Board wrappers provided for Artix-7, Kintex-7, and UltraScale+.
+- **No vendor primitives** — pure portable RTL that works on any target. Synthesis tested via Yosys for generic (ASIC), Xilinx 7-series, UltraScale, and UltraScale+. Board wrappers provided for Artix-7, Kintex-7, and UltraScale+.
 - **Apache 2.0 licensed** — permissive license suitable for commercial and academic use.
 
 ## Features
@@ -253,7 +253,7 @@ Running `pytest tests/` exercises:
 - **Directed tests** — atomic operations (LR/SC), trap handling, compressed instructions
 - **C program simulation** — all sample applications (hello_world, coremark, freertos_demo, etc.) run in simulation with pass/fail detection
 - **C compilation** — all applications compile successfully with the RISC-V toolchain
-- **Yosys synthesis** — RTL synthesizes cleanly for generic (ASIC) and Xilinx targets
+- **Yosys synthesis** — RTL synthesizes cleanly for generic (ASIC), Xilinx 7-series, UltraScale, and UltraScale+ targets
 
 ### FPGA Deployment
 
