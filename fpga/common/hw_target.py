@@ -18,11 +18,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Map board names to expected vendor string in hardware target path
-BOARD_VENDOR_FILTER = {
-    "nexys_a7": "Digilent",
-    "genesys2": "Digilent",
-    "x3": "Xilinx",
+# Map board names to vendor info: (filter_pattern, display_name)
+# Note: X3 uses "/Xilinx/" pattern to avoid matching "xilinx_tcf" which appears in all targets
+BOARD_VENDOR_INFO = {
+    "nexys_a7": ("Digilent", "Digilent"),
+    "genesys2": ("Digilent", "Digilent"),
+    "x3": ("/Xilinx/", "Xilinx"),
 }
 
 
@@ -155,24 +156,26 @@ def select_target(
         sys.exit(1)
 
     # Apply board-based vendor filter if board is specified
-    vendor_filter = BOARD_VENDOR_FILTER.get(board) if board else None
-    if vendor_filter:
-        targets = filter_targets(all_targets, vendor_filter)
+    vendor_info = BOARD_VENDOR_INFO.get(board) if board else None
+    if vendor_info:
+        vendor_pattern, vendor_name = vendor_info
+        targets = filter_targets(all_targets, vendor_pattern)
         if not targets:
             print(
-                f"Error: No {vendor_filter} targets found for board '{board}'",
+                f"Error: No {vendor_name} targets found for board '{board}'",
                 file=sys.stderr,
             )
             print_target_list(all_targets, header="All available targets:")
             sys.exit(1)
     else:
+        vendor_name = None
         targets = all_targets
 
     # List-only mode
     if list_only:
-        if vendor_filter:
+        if vendor_name:
             print_target_list(
-                targets, header=f"Available {vendor_filter} targets for '{board}':"
+                targets, header=f"Available {vendor_name} targets for '{board}':"
             )
         else:
             print_target_list(targets)
@@ -203,8 +206,8 @@ def select_target(
         return targets[0]
 
     # Multiple targets after board filter - prompt user
-    if vendor_filter:
-        print(f"Multiple {vendor_filter} targets detected for board '{board}'.")
+    if vendor_name:
+        print(f"Multiple {vendor_name} targets detected for board '{board}'.")
     else:
         print("Multiple hardware targets detected.")
     return prompt_target_selection(targets)
