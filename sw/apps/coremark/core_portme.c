@@ -126,6 +126,25 @@ get_time(void)
 */
 secs_ret time_in_secs(CORE_TICKS ticks)
 {
+#if HAS_FLOAT
+    uint64_t ticks_per_sec = EE_TICKS_PER_SEC;
+    if (ticks_per_sec == 0)
+        ticks_per_sec = 1; /* Prevent div-by-zero for very low clocks */
+
+    /* Use integer division for whole seconds to avoid 64-bit float conversion. */
+    uint64_t whole_secs = ticks / ticks_per_sec;
+    uint32_t rem_ticks = (uint32_t) (ticks % ticks_per_sec);
+    uint32_t denom_ticks = (uint32_t) ticks_per_sec;
+
+    float frac = 0.0f;
+    if (denom_ticks != 0) {
+        float rem_f = (float) rem_ticks;
+        float denom_f = (float) denom_ticks;
+        frac = rem_f / denom_f;
+    }
+
+    return (secs_ret) whole_secs + (secs_ret) frac;
+#else
     /* Shift both values right to avoid 64-bit division (no libgcc needed) */
     /* Shifting by 20 bits preserves enough precision for seconds calculation */
     ee_u32 ticks_shifted = (ee_u32) (ticks >> 20);
@@ -133,6 +152,7 @@ secs_ret time_in_secs(CORE_TICKS ticks)
     if (divisor_shifted == 0)
         divisor_shifted = 1; /* Prevent div-by-zero for very low clocks */
     return (secs_ret) (ticks_shifted / divisor_shifted);
+#endif
 }
 
 ee_u32 default_num_contexts = 1;

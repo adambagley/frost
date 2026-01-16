@@ -23,7 +23,7 @@
  *
  * Features:
  *   - Automatic CR+LF line ending conversion
- *   - Printf format specifiers: %c, %s, %d, %u, %x, %X, %ld, %lu, %lld, %llu
+ *   - Printf format specifiers: %c, %s, %d, %u, %x, %X, %ld, %lu, %lld, %llu, %f
  *   - Field width and zero-padding support (e.g., %08x, %4d)
  */
 
@@ -141,8 +141,52 @@ static inline void uart_put_longlong(long long value)
     uart_put_signed_decimal(value, 20); /* Maximum 20 digits for 64-bit signed */
 }
 
+#if UART_PRINTF_ENABLE_FLOAT
+static void uart_put_float(double value, int precision)
+{
+    float fval = (float) value;
+    if (fval != fval) {
+        uart_puts("nan");
+        return;
+    }
+    if (fval > 3.4028235e38f) {
+        uart_puts("inf");
+        return;
+    }
+    if (fval < -3.4028235e38f) {
+        uart_puts("-inf");
+        return;
+    }
+
+    if (precision < 0)
+        precision = 6;
+
+    if (fval < 0.0f) {
+        uart_putchar('-');
+        fval = -fval;
+    }
+
+    unsigned long long int_part = (unsigned long long) fval;
+    uart_put_unsigned_decimal(int_part, 20);
+
+    if (precision == 0)
+        return;
+
+    uart_putchar('.');
+    float frac = fval - (float) int_part;
+    if (frac < 0.0f)
+        frac = 0.0f;
+    for (int i = 0; i < precision; ++i) {
+        frac *= 10.0f;
+        int digit = (int) frac;
+        uart_putchar((char) ('0' + digit));
+        frac -= (float) digit;
+    }
+}
+#endif
+
 /* ------------------------------------------------------------------------- */
-/* very small printf (now understands %lu)                                   */
+/* very small printf (now understands %f)                                    */
 /* ------------------------------------------------------------------------- */
 void uart_printf(const char *fmt, ...)
 {
@@ -159,6 +203,7 @@ void uart_printf(const char *fmt, ...)
 
         /* Parse format specifier flags and width */
         int zero_pad = 0, width = 0;
+        int precision = -1;
 
         if (*++p == '0') {
             /* Leading '0' flag - pad with zeros instead of spaces */
@@ -170,6 +215,16 @@ void uart_printf(const char *fmt, ...)
         while (*p >= '0' && *p <= '9') {
             width = width * 10 + (*p - '0');
             ++p;
+        }
+
+        /* Parse optional precision (e.g., %.3f) */
+        if (*p == '.') {
+            precision = 0;
+            ++p;
+            while (*p >= '0' && *p <= '9') {
+                precision = precision * 10 + (*p - '0');
+                ++p;
+            }
         }
 
         /* Limit field width to 8 digits maximum.
@@ -254,6 +309,17 @@ void uart_printf(const char *fmt, ...)
 
                 /* Print actual hex value (uppercase if %X, lowercase if %x) */
                 uart_put_hex(hexval, ndigits, *p == 'X');
+                break;
+            }
+
+            case 'f': {
+#if UART_PRINTF_ENABLE_FLOAT
+                /* %f - floating point (double promoted) */
+                uart_put_float(va_arg(args, double), precision);
+#else
+                uart_putchar('%');
+                uart_putchar('f');
+#endif
                 break;
             }
 

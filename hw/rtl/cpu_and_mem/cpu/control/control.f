@@ -1,8 +1,11 @@
 # Pipeline control unit file list
 # Hazard detection, forwarding, stall/flush control, trap handling, and atomics
 
-# Forwarding unit - resolves RAW data hazards by forwarding from MA/WB to EX
+# Forwarding unit - resolves integer RAW data hazards by forwarding from MA/WB to EX
 $(ROOT)/hw/rtl/cpu_and_mem/cpu/control/forwarding_unit.sv
+
+# F extension: FP forwarding unit - resolves FP RAW hazards (3 source operands for FMA)
+$(ROOT)/hw/rtl/cpu_and_mem/cpu/control/fp_forwarding_unit.sv
 
 # Hazard resolution unit - manages pipeline stalls and flushes
 $(ROOT)/hw/rtl/cpu_and_mem/cpu/control/hazard_resolution_unit.sv

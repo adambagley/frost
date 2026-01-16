@@ -22,9 +22,16 @@
   ALU results and memory data from the EX stage, processes loads through the load unit,
   and forwards either the load result or ALU result to the Write Back stage. The pipeline
   register at the end of this stage prepares the final result for register file writeback.
+
+  F Extension support:
+  - FLW (FP load word) uses the same memory path as LW, but writes to FP register file
+  - FSW (FP store word) is handled entirely in EX stage (store unit)
+  - FP computation results and flags are passed through to WB stage
 */
 module ma_stage #(
-    parameter int unsigned XLEN = 32
+    parameter int unsigned XLEN = 32,
+    parameter int unsigned MMIO_ADDR = 32'h4000_0000,
+    parameter int unsigned MMIO_SIZE_BYTES = 32'h28
 ) (
     input logic i_clk,
     input riscv_pkg::pipeline_ctrl_t i_pipeline_ctrl,
@@ -43,17 +50,26 @@ module ma_stage #(
   logic [XLEN-1:0] data_memory_read_data;
   logic [XLEN-1:0] data_memory_read_data_registered;
 
+  // MMIO loads use registered data from cpu_and_mem, so bypass local stall capture.
+  logic is_mmio_load;
+  assign is_mmio_load =
+      (i_from_ex_to_ma.is_load_instruction | i_from_ex_to_ma.is_lr |
+       i_from_ex_to_ma.is_fp_load) &&
+      (i_from_ex_to_ma.data_memory_address >= MMIO_ADDR) &&
+      (i_from_ex_to_ma.data_memory_address < (MMIO_ADDR + MMIO_SIZE_BYTES));
+
   /*
     Handle memory read data with block RAM latency.
     Data is delayed by 1 cycle, so we must preserve it during stalls
     to ensure the same data is available throughout a stalled cycle.
   */
   always_ff @(posedge i_clk)
-    if (i_pipeline_ctrl.stall & ~i_pipeline_ctrl.stall_registered)
+    if (i_pipeline_ctrl.stall & ~i_pipeline_ctrl.stall_registered & ~is_mmio_load)
       data_memory_read_data_registered <= i_data_mem_rd_data;
-  assign data_memory_read_data = i_pipeline_ctrl.stall_registered ?
-                                 data_memory_read_data_registered :
-                                 i_data_mem_rd_data;
+  assign data_memory_read_data = is_mmio_load ? i_data_mem_rd_data :
+                                 (i_pipeline_ctrl.stall_registered ?
+                                  data_memory_read_data_registered :
+                                  i_data_mem_rd_data);
 
   // Load unit extracts and sign/zero-extends the appropriate bytes
   load_unit #(
@@ -111,6 +127,11 @@ module ma_stage #(
     if (i_pipeline_ctrl.reset) begin
       o_from_ma_to_wb.instruction <= riscv_pkg::NOP;
       o_from_ma_to_wb.regfile_write_enable <= 1'b0;
+      // F extension
+      o_from_ma_to_wb.fp_regfile_write_enable <= 1'b0;
+      o_from_ma_to_wb.fp_regfile_write_data <= '0;
+      o_from_ma_to_wb.fp_flags <= '0;
+      o_from_ma_to_wb.fp_dest_reg <= 5'b0;
     end else if (do_amo_update) begin
       // AMO update: either immediate or deferred from pending
       if (amo_update_pending) begin
@@ -139,20 +160,36 @@ module ma_stage #(
       // - Load instructions (LW, LH, LB, etc.): use loaded/sign-extended data
       // - LR.W (load-reserved): use loaded data (like a load)
       // - SC.W (store-conditional): use sc_success result (0=success, 1=fail)
+      // - FP-to-int (FMV.X.W, FCVT.W.S, etc.): use FP result
       // - Other instructions: use ALU result
       if (i_from_ex_to_ma.is_load_instruction || i_from_ex_to_ma.is_lr) begin
         o_from_ma_to_wb.regfile_write_data <= o_from_ma_comb.data_loaded_from_memory;
       end else if (i_from_ex_to_ma.is_sc) begin
         // SC.W: write 0 if success, 1 if fail
         o_from_ma_to_wb.regfile_write_data <= {31'b0, ~i_from_ex_to_ma.sc_success};
+      end else if (i_from_ex_to_ma.is_fp_to_int) begin
+        // FP-to-int: use FP result for integer regfile write
+        o_from_ma_to_wb.regfile_write_data <= i_from_ex_to_ma.fp_result;
       end else begin
         o_from_ma_to_wb.regfile_write_data <= i_from_ex_to_ma.alu_result;
       end
+      // F extension: FP write data and flags
+      // FLW: use memory data, FP compute: use fp_result from EX stage
+      if (i_from_ex_to_ma.is_fp_load) begin
+        o_from_ma_to_wb.fp_regfile_write_data <= data_memory_read_data;
+      end else begin
+        o_from_ma_to_wb.fp_regfile_write_data <= i_from_ex_to_ma.fp_result;
+      end
+      o_from_ma_to_wb.fp_regfile_write_enable <= i_from_ex_to_ma.fp_regfile_write_enable;
+      o_from_ma_to_wb.fp_flags <= i_from_ex_to_ma.fp_flags;
+      o_from_ma_to_wb.fp_dest_reg <= i_from_ex_to_ma.fp_dest_reg;
     end
   end
 
   // Signals for L0 cache updates and data forwarding
   assign o_from_ma_comb.data_memory_read_data = data_memory_read_data;
+  // F extension: Direct BRAM output for FP load forwarding (bypasses stall_registered mux)
+  assign o_from_ma_comb.data_memory_read_data_direct = i_data_mem_rd_data;
 
   // Output the delayed AMO write enable for regfile bypass
   assign o_amo_write_enable_delayed = amo_write_enable_delayed;

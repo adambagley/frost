@@ -17,10 +17,11 @@
 /**
  * RISC-V ISA Compliance Test Suite for Frost Processor
  *
- * Tests all extensions claimed by Frost (RV32IMACB):
+ * Tests all extensions claimed by Frost (RV32IMAFCB):
  *   - RV32I:  Base integer instruction set
  *   - M:      Integer multiply/divide
  *   - A:      Atomic memory operations
+ *   - F:      Single-precision floating-point
  *   - C:      Compressed 16-bit instructions
  *   - B:      Bit manipulation (B = Zba + Zbb + Zbs)
  *   - Zicsr:  CSR access instructions
@@ -57,6 +58,7 @@ typedef enum {
     EXT_M,
     EXT_A,
     EXT_C,
+    EXT_F,
     EXT_ZICSR,
     EXT_ZICNTR,
     EXT_ZIFENCEI,
@@ -76,6 +78,7 @@ static const char *extension_names[EXT_COUNT] = {
     "M",           /* Multiply/divide */
     "A",           /* Atomics */
     "C",           /* Compressed 16-bit instructions */
+    "F",           /* Single-precision floating-point */
     "Zicsr",       /* CSR instructions */
     "Zicntr",      /* Counters */
     "Zifencei",    /* Instruction fence */
@@ -1078,6 +1081,66 @@ static void test_c_extension(void)
                      : "=r"(result)::"a1");
     TEST("swsp", result, 0xBEEFCAFE);
 
+    /* ===== Compressed Floating-Point Load/Store (RV32FC) ===== */
+
+    /* C.FSW: Store FP register to memory using compressed format */
+    /* Format: c.fsw rs2', offset(rs1') where rs1', rs2' are x8-x15/f8-f15 */
+    volatile uint32_t cfp_mem[4] __attribute__((aligned(4)));
+    cfp_mem[0] = 0;
+    __asm__ volatile("li s0, 0x12345678\n" /* Load test pattern into x8 */
+                     "fmv.w.x fs1, s0\n"   /* Move to f9 (fs1) */
+                     "mv s0, %0\n"         /* s0 = &cfp_mem[0] */
+                     "c.fsw fs1, 0(s0)\n"  /* Store f9 to memory via C.FSW */
+                     :
+                     : "r"(&cfp_mem[0])
+                     : "s0", "fs1", "memory");
+    TEST("c.fsw", cfp_mem[0], 0x12345678);
+
+    /* C.FLW: Load FP register from memory using compressed format */
+    /* Note: C.FLW only supports f8-f15 (fs0-fs1, fa0-fa5) */
+    cfp_mem[1] = 0xDEADBEEF;
+    __asm__ volatile("mv s0, %1\n"        /* s0 = &cfp_mem[1] */
+                     "c.flw fa0, 0(s0)\n" /* Load from memory into f10 (fa0) */
+                     "fmv.x.w %0, fa0\n"  /* Move to integer for checking */
+                     : "=r"(result)
+                     : "r"(&cfp_mem[1])
+                     : "s0", "fa0");
+    TEST("c.flw", result, 0xDEADBEEF);
+
+    /* C.FLW with offset: Load from base+offset */
+    cfp_mem[2] = 0xCAFEBABE;
+    __asm__ volatile("mv s0, %1\n"        /* s0 = &cfp_mem[0] */
+                     "c.flw fa1, 8(s0)\n" /* Load cfp_mem[2] into f11 (fa1) */
+                     "fmv.x.w %0, fa1\n"
+                     : "=r"(result)
+                     : "r"(&cfp_mem[0])
+                     : "s0", "fa1");
+    TEST("c.flw+o", result, 0xCAFEBABE);
+
+    /* C.FSWSP: Store FP register to stack using compressed format */
+    __asm__ volatile("addi sp, sp, -16\n"
+                     "li t0, 0xABCD1234\n"
+                     "fmv.w.x ft0, t0\n"    /* ft0 = 0xABCD1234 */
+                     "c.fswsp ft0, 0(sp)\n" /* Store to stack */
+                     "lw %0, 0(sp)\n"       /* Load back as integer to check */
+                     "addi sp, sp, 16\n"
+                     : "=r"(result)
+                     :
+                     : "t0", "ft0", "memory");
+    TEST("c.fswsp", result, 0xABCD1234);
+
+    /* C.FLWSP: Load FP register from stack using compressed format */
+    __asm__ volatile("addi sp, sp, -16\n"
+                     "li t0, 0x87654321\n"
+                     "sw t0, 4(sp)\n"       /* Store test value at sp+4 */
+                     "c.flwsp ft1, 4(sp)\n" /* Load into ft1 */
+                     "fmv.x.w %0, ft1\n"    /* Move to integer for checking */
+                     "addi sp, sp, 16\n"
+                     : "=r"(result)
+                     :
+                     : "t0", "ft1", "memory");
+    TEST("c.flwsp", result, 0x87654321);
+
     uint32_t old_mtvec;
     __asm__ volatile("csrr %0, mtvec" : "=r"(old_mtvec));
     __asm__ volatile("csrw mtvec, %0" ::"r"((uint32_t) c_test_trap_handler));
@@ -1091,6 +1154,950 @@ static void test_c_extension(void)
 
     __asm__ volatile("csrw mtvec, %0" ::"r"(old_mtvec));
     __asm__ volatile("csrs mstatus, %0" ::"r"(0x8)); /* Re-enable interrupts */
+
+    END_EXTENSION();
+}
+
+/* ========================================================================== */
+/* F Extension Tests (Single-Precision Floating-Point)                        */
+/* ========================================================================== */
+
+/* IEEE 754 single-precision constants */
+#define FP_POS_ZERO 0x00000000U   /* +0.0 */
+#define FP_NEG_ZERO 0x80000000U   /* -0.0 */
+#define FP_POS_ONE 0x3F800000U    /* +1.0 */
+#define FP_NEG_ONE 0xBF800000U    /* -1.0 */
+#define FP_POS_TWO 0x40000000U    /* +2.0 */
+#define FP_POS_THREE 0x40400000U  /* +3.0 */
+#define FP_POS_FOUR 0x40800000U   /* +4.0 */
+#define FP_POS_HALF 0x3F000000U   /* +0.5 */
+#define FP_POS_INF 0x7F800000U    /* +infinity */
+#define FP_NEG_INF 0xFF800000U    /* -infinity */
+#define FP_QNAN 0x7FC00000U       /* Quiet NaN (canonical) */
+#define FP_SNAN 0x7F800001U       /* Signaling NaN */
+#define FP_POS_DENORM 0x00000001U /* Smallest positive denormal */
+#define FP_NEG_DENORM 0x80000001U /* Smallest negative denormal */
+#define FP_POS_MAX 0x7F7FFFFFU    /* Largest finite positive */
+#define FP_NEG_MAX 0xFF7FFFFFU    /* Largest finite negative */
+#define FP_PI 0x40490FDBU         /* ~3.14159265 */
+#define FP_E 0x402DF854U          /* ~2.71828182 */
+
+/* FCLASS bit positions */
+#define FCLASS_NEG_INF (1 << 0)
+#define FCLASS_NEG_NORMAL (1 << 1)
+#define FCLASS_NEG_SUBNORM (1 << 2)
+#define FCLASS_NEG_ZERO (1 << 3)
+#define FCLASS_POS_ZERO (1 << 4)
+#define FCLASS_POS_SUBNORM (1 << 5)
+#define FCLASS_POS_NORMAL (1 << 6)
+#define FCLASS_POS_INF (1 << 7)
+#define FCLASS_SNAN (1 << 8)
+#define FCLASS_QNAN (1 << 9)
+
+/* Helper to convert uint32_t bit pattern to float */
+static inline float u32_to_float(uint32_t bits)
+{
+    union {
+        uint32_t u;
+        float f;
+    } conv;
+    conv.u = bits;
+    return conv.f;
+}
+
+/* Helper to convert float to uint32_t bit pattern */
+static inline uint32_t float_to_u32(float f)
+{
+    union {
+        uint32_t u;
+        float f;
+    } conv;
+    conv.f = f;
+    return conv.u;
+}
+
+/* Storage for FLW/FSW tests */
+static volatile float fp_test_mem[4] __attribute__((aligned(4)));
+
+static void test_f_extension(void)
+{
+    BEGIN_EXTENSION(EXT_F);
+
+    uint32_t result;
+    float fresult;
+
+    uart_printf("  F: Starting FMV tests\n");
+
+    /* ===================================================================== */
+    /* FMV.W.X / FMV.X.W - Move between integer and FP registers             */
+    /* ===================================================================== */
+
+    /* FMV.W.X: Move bits from integer register to FP register */
+    /* FMV.X.W: Move bits from FP register to integer register */
+    uart_printf("  F: Before FMV roundtrip\n");
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE)
+                     : "ft0");
+    uart_printf("  F: After FMV roundtrip\n");
+    TEST("FMV roundtrip", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ZERO)
+                     : "ft0");
+    TEST("FMV -0", result, FP_NEG_ZERO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_QNAN)
+                     : "ft0");
+    TEST("FMV NaN", result, FP_QNAN);
+
+    /* ===================================================================== */
+    /* FLW / FSW - Floating-Point Load/Store                                 */
+    /* ===================================================================== */
+
+    /* FSW: Store float to memory */
+    fresult = u32_to_float(FP_PI);
+    __asm__ volatile("fsw %0, 0(%1)" ::"f"(fresult), "r"(&fp_test_mem[0]) : "memory");
+    result = *(volatile uint32_t *) &fp_test_mem[0];
+    TEST("FSW basic", result, FP_PI);
+
+    /* FLW: Load float from memory */
+    *(volatile uint32_t *) &fp_test_mem[1] = FP_E;
+    __asm__ volatile("flw ft1, 0(%1)\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(&fp_test_mem[1])
+                     : "ft1", "memory");
+    TEST("FLW basic", result, FP_E);
+
+    /* Test with offset */
+    *(volatile uint32_t *) &fp_test_mem[2] = FP_POS_TWO;
+    __asm__ volatile("flw ft2, 8(%1)\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(&fp_test_mem[0])
+                     : "ft2", "memory");
+    TEST("FLW offset", result, FP_POS_TWO);
+
+    /* ===================================================================== */
+    /* FSGNJ.S / FSGNJN.S / FSGNJX.S - Sign Injection                        */
+    /* ===================================================================== */
+
+    /* FSGNJ.S: result = |rs1| with sign of rs2 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsgnj.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_NEG_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSGNJ +,- -> -", result, FP_NEG_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsgnj.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSGNJ -,+ -> +", result, FP_POS_ONE);
+
+    /* FSGNJN.S: result = |rs1| with negated sign of rs2 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsgnjn.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_NEG_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSGNJN +,- -> +", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsgnjn.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSGNJN +,+ -> -", result, FP_NEG_ONE);
+
+    /* FSGNJX.S: result = rs1 with sign = rs1.sign XOR rs2.sign */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsgnjx.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_NEG_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSGNJX +,- -> -", result, FP_NEG_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsgnjx.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_NEG_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSGNJX -,- -> +", result, FP_POS_ONE);
+
+    /* FABS (pseudo: FSGNJX with same operand) */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fabs.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE)
+                     : "ft0", "ft1");
+    TEST("FABS -1 -> +1", result, FP_POS_ONE);
+
+    /* FNEG (pseudo: FSGNJN with same operand) */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fneg.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE)
+                     : "ft0", "ft1");
+    TEST("FNEG +1 -> -1", result, FP_NEG_ONE);
+
+    /* ===================================================================== */
+    /* FCLASS.S - Classify floating-point value                              */
+    /* ===================================================================== */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_NEG_INF)
+                     : "ft0");
+    TEST("FCLASS -inf", result, FCLASS_NEG_INF);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE)
+                     : "ft0");
+    TEST("FCLASS -normal", result, FCLASS_NEG_NORMAL);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_NEG_DENORM)
+                     : "ft0");
+    TEST("FCLASS -subnorm", result, FCLASS_NEG_SUBNORM);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ZERO)
+                     : "ft0");
+    TEST("FCLASS -0", result, FCLASS_NEG_ZERO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_POS_ZERO)
+                     : "ft0");
+    TEST("FCLASS +0", result, FCLASS_POS_ZERO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_POS_DENORM)
+                     : "ft0");
+    TEST("FCLASS +subnorm", result, FCLASS_POS_SUBNORM);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE)
+                     : "ft0");
+    TEST("FCLASS +normal", result, FCLASS_POS_NORMAL);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_POS_INF)
+                     : "ft0");
+    TEST("FCLASS +inf", result, FCLASS_POS_INF);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_SNAN)
+                     : "ft0");
+    TEST("FCLASS sNaN", result, FCLASS_SNAN);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fclass.s %0, ft0"
+                     : "=r"(result)
+                     : "r"(FP_QNAN)
+                     : "ft0");
+    TEST("FCLASS qNaN", result, FCLASS_QNAN);
+
+    /* ===================================================================== */
+    /* FEQ.S / FLT.S / FLE.S - Floating-Point Comparisons                    */
+    /* ===================================================================== */
+
+    /* FEQ.S: rd = (rs1 == rs2) ? 1 : 0 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "feq.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1");
+    TEST("FEQ 1==1", result, 1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "feq.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1");
+    TEST("FEQ 1==2", result, 0);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "feq.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ZERO), "r"(FP_NEG_ZERO)
+                     : "ft0", "ft1");
+    TEST("FEQ +0==-0", result, 1); /* +0 and -0 are equal */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "feq.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_QNAN), "r"(FP_QNAN)
+                     : "ft0", "ft1");
+    TEST("FEQ NaN==NaN", result, 0); /* NaN != NaN */
+
+    /* FLT.S: rd = (rs1 < rs2) ? 1 : 0 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "flt.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1");
+    TEST("FLT 1<2", result, 1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "flt.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_ONE)
+                     : "ft0", "ft1");
+    TEST("FLT 2<1", result, 0);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "flt.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1");
+    TEST("FLT -1<1", result, 1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "flt.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_NEG_INF), "r"(FP_POS_INF)
+                     : "ft0", "ft1");
+    TEST("FLT -inf<+inf", result, 1);
+
+    /* FLE.S: rd = (rs1 <= rs2) ? 1 : 0 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fle.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1");
+    TEST("FLE 1<=1", result, 1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fle.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1");
+    TEST("FLE 1<=2", result, 1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fle.s %0, ft0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_ONE)
+                     : "ft0", "ft1");
+    TEST("FLE 2<=1", result, 0);
+
+    /* ===================================================================== */
+    /* FMIN.S / FMAX.S - Minimum and Maximum                                 */
+    /* ===================================================================== */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmin.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMIN 1,2", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmin.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMIN -1,1", result, FP_NEG_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmin.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ZERO), "r"(FP_NEG_ZERO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMIN +0,-0", result, FP_NEG_ZERO); /* -0 is smaller */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmax.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMAX 1,2", result, FP_POS_TWO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmax.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMAX -1,1", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmax.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ZERO), "r"(FP_NEG_ZERO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMAX +0,-0", result, FP_POS_ZERO); /* +0 is larger */
+
+    /* FMIN/FMAX with NaN: return the non-NaN operand */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmin.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_QNAN)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMIN 1,NaN", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmax.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_QNAN), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMAX NaN,2", result, FP_POS_TWO);
+
+    /* ===================================================================== */
+    /* FCVT.W.S / FCVT.WU.S - Float to Integer Conversion                    */
+    /* ===================================================================== */
+
+    /* FCVT.W.S: Convert float to signed 32-bit integer */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.w.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE)
+                     : "ft0");
+    TEST("FCVT.W.S 1.0", result, 1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.w.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE)
+                     : "ft0");
+    TEST("FCVT.W.S -1.0", result, (uint32_t) -1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.w.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_PI)
+                     : "ft0");
+    TEST("FCVT.W.S pi->3", result, 3);
+
+    /* Overflow: +inf -> INT32_MAX */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.w.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_POS_INF)
+                     : "ft0");
+    TEST("FCVT.W.S +inf", result, 0x7FFFFFFF);
+
+    /* Overflow: -inf -> INT32_MIN */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.w.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_NEG_INF)
+                     : "ft0");
+    TEST("FCVT.W.S -inf", result, 0x80000000);
+
+    /* NaN -> INT32_MAX */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.w.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_QNAN)
+                     : "ft0");
+    TEST("FCVT.W.S NaN", result, 0x7FFFFFFF);
+
+    /* FCVT.WU.S: Convert float to unsigned 32-bit integer */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.wu.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE)
+                     : "ft0");
+    TEST("FCVT.WU.S 1.0", result, 1);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.wu.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO)
+                     : "ft0");
+    TEST("FCVT.WU.S 2.0", result, 2);
+
+    /* Negative -> 0 (saturates) */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fcvt.wu.s %0, ft0, rtz"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE)
+                     : "ft0");
+    TEST("FCVT.WU.S -1.0", result, 0);
+
+    /* ===================================================================== */
+    /* FCVT.S.W / FCVT.S.WU - Integer to Float Conversion                    */
+    /* ===================================================================== */
+
+    /* FCVT.S.W: Convert signed 32-bit integer to float */
+    __asm__ volatile("fcvt.s.w ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(1)
+                     : "ft0");
+    TEST("FCVT.S.W 1", result, FP_POS_ONE);
+
+    __asm__ volatile("fcvt.s.w ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(-1)
+                     : "ft0");
+    TEST("FCVT.S.W -1", result, FP_NEG_ONE);
+
+    __asm__ volatile("fcvt.s.w ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(0)
+                     : "ft0");
+    TEST("FCVT.S.W 0", result, FP_POS_ZERO);
+
+    /* FCVT.S.WU: Convert unsigned 32-bit integer to float */
+    __asm__ volatile("fcvt.s.wu ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(1U)
+                     : "ft0");
+    TEST("FCVT.S.WU 1", result, FP_POS_ONE);
+
+    __asm__ volatile("fcvt.s.wu ft0, %1\n\t"
+                     "fmv.x.w %0, ft0"
+                     : "=r"(result)
+                     : "r"(2U)
+                     : "ft0");
+    TEST("FCVT.S.WU 2", result, FP_POS_TWO);
+
+    /* ===================================================================== */
+    /* FADD.S / FSUB.S - Floating-Point Addition and Subtraction             */
+    /* ===================================================================== */
+
+    /* FADD.S: rd = rs1 + rs2 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fadd.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FADD 1+1=2", result, FP_POS_TWO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fadd.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_NEG_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FADD 1+(-1)=0", result, FP_POS_ZERO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fadd.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ZERO), "r"(FP_NEG_ZERO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FADD +0+(-0)=+0", result, FP_POS_ZERO);
+
+    /* FADD with infinity */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fadd.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_INF)
+                     : "ft0", "ft1", "ft2");
+    TEST("FADD 1+inf=inf", result, FP_POS_INF);
+
+    /* FSUB.S: rd = rs1 - rs2 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsub.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSUB 2-1=1", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsub.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSUB 1-2=-1", result, FP_NEG_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fsub.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FSUB 1-1=0", result, FP_POS_ZERO);
+
+    /* ===================================================================== */
+    /* FMUL.S - Floating-Point Multiplication                                */
+    /* ===================================================================== */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmul.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMUL 2*2=4", result, FP_POS_FOUR);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmul.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_HALF)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMUL 2*0.5=1", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmul.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_NEG_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMUL -1*-1=1", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmul.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_NEG_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMUL 1*-1=-1", result, FP_NEG_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmul.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ZERO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FMUL 1*0=0", result, FP_POS_ZERO);
+
+    /* ===================================================================== */
+    /* FDIV.S - Floating-Point Division                                      */
+    /* ===================================================================== */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fdiv.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_FOUR), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FDIV 4/2=2", result, FP_POS_TWO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fdiv.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FDIV 1/2=0.5", result, FP_POS_HALF);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fdiv.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2");
+    TEST("FDIV -1/1=-1", result, FP_NEG_ONE);
+
+    /* Division by zero -> infinity */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fdiv.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ZERO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FDIV 1/0=+inf", result, FP_POS_INF);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fdiv.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE), "r"(FP_POS_ZERO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FDIV -1/0=-inf", result, FP_NEG_INF);
+
+    /* 0/0 -> NaN */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fdiv.s ft2, ft0, ft1\n\t"
+                     "fmv.x.w %0, ft2"
+                     : "=r"(result)
+                     : "r"(FP_POS_ZERO), "r"(FP_POS_ZERO)
+                     : "ft0", "ft1", "ft2");
+    TEST("FDIV 0/0=NaN", result, FP_QNAN);
+
+    /* ===================================================================== */
+    /* FSQRT.S - Floating-Point Square Root                                  */
+    /* ===================================================================== */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fsqrt.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_FOUR)
+                     : "ft0", "ft1");
+    TEST("FSQRT 4=2", result, FP_POS_TWO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fsqrt.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE)
+                     : "ft0", "ft1");
+    TEST("FSQRT 1=1", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fsqrt.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_ZERO)
+                     : "ft0", "ft1");
+    TEST("FSQRT +0=+0", result, FP_POS_ZERO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fsqrt.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ZERO)
+                     : "ft0", "ft1");
+    TEST("FSQRT -0=-0", result, FP_NEG_ZERO);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fsqrt.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_POS_INF)
+                     : "ft0", "ft1");
+    TEST("FSQRT +inf=+inf", result, FP_POS_INF);
+
+    /* sqrt(-1) -> NaN */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fsqrt.s ft1, ft0\n\t"
+                     "fmv.x.w %0, ft1"
+                     : "=r"(result)
+                     : "r"(FP_NEG_ONE)
+                     : "ft0", "ft1");
+    TEST("FSQRT -1=NaN", result, FP_QNAN);
+
+    /* ===================================================================== */
+    /* FMADD.S / FMSUB.S / FNMADD.S / FNMSUB.S - Fused Multiply-Add          */
+    /* ===================================================================== */
+
+    /* FMADD.S: rd = (rs1 * rs2) + rs3 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmv.w.x ft2, %3\n\t"
+                     "fmadd.s ft3, ft0, ft1, ft2\n\t"
+                     "fmv.x.w %0, ft3"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_TWO), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2", "ft3");
+    TEST("FMADD 2*2+1=5", result, 0x40A00000); /* 5.0 */
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmv.w.x ft2, %3\n\t"
+                     "fmadd.s ft3, ft0, ft1, ft2\n\t"
+                     "fmv.x.w %0, ft3"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2", "ft3");
+    TEST("FMADD 1*1+1=2", result, FP_POS_TWO);
+
+    /* FMSUB.S: rd = (rs1 * rs2) - rs3 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmv.w.x ft2, %3\n\t"
+                     "fmsub.s ft3, ft0, ft1, ft2\n\t"
+                     "fmv.x.w %0, ft3"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_TWO), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2", "ft3");
+    TEST("FMSUB 2*2-1=3", result, FP_POS_THREE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmv.w.x ft2, %3\n\t"
+                     "fmsub.s ft3, ft0, ft1, ft2\n\t"
+                     "fmv.x.w %0, ft3"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2", "ft3");
+    TEST("FMSUB 1*1-1=0", result, FP_POS_ZERO);
+
+    /* FNMADD.S: rd = -(rs1 * rs2) - rs3 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmv.w.x ft2, %3\n\t"
+                     "fnmadd.s ft3, ft0, ft1, ft2\n\t"
+                     "fmv.x.w %0, ft3"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2", "ft3");
+    TEST("FNMADD -(1*1)-1=-2", result, 0xC0000000); /* -2.0 */
+
+    /* FNMSUB.S: rd = -(rs1 * rs2) + rs3 */
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmv.w.x ft2, %3\n\t"
+                     "fnmsub.s ft3, ft0, ft1, ft2\n\t"
+                     "fmv.x.w %0, ft3"
+                     : "=r"(result)
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ONE), "r"(FP_POS_TWO)
+                     : "ft0", "ft1", "ft2", "ft3");
+    TEST("FNMSUB -(1*1)+2=1", result, FP_POS_ONE);
+
+    __asm__ volatile("fmv.w.x ft0, %1\n\t"
+                     "fmv.w.x ft1, %2\n\t"
+                     "fmv.w.x ft2, %3\n\t"
+                     "fnmsub.s ft3, ft0, ft1, ft2\n\t"
+                     "fmv.x.w %0, ft3"
+                     : "=r"(result)
+                     : "r"(FP_POS_TWO), "r"(FP_POS_TWO), "r"(FP_POS_ONE)
+                     : "ft0", "ft1", "ft2", "ft3");
+    TEST("FNMSUB -(2*2)+1=-3", result, 0xC0400000); /* -3.0 */
+
+    /* ===================================================================== */
+    /* FP CSR Tests - fflags, frm, fcsr                                      */
+    /* ===================================================================== */
+
+    /* Clear fflags before testing */
+    __asm__ volatile("csrw fflags, zero");
+
+    /* Trigger invalid operation (sqrt of negative) */
+    __asm__ volatile("fmv.w.x ft0, %0\n\t"
+                     "fsqrt.s ft1, ft0"
+                     :
+                     : "r"(FP_NEG_ONE)
+                     : "ft0", "ft1");
+    __asm__ volatile("csrr %0, fflags" : "=r"(result));
+    TEST("fflags NV set", (result & 0x10) != 0, 1);
+
+    /* Clear fflags */
+    __asm__ volatile("csrw fflags, zero");
+
+    /* Trigger divide by zero */
+    __asm__ volatile("fmv.w.x ft0, %0\n\t"
+                     "fmv.w.x ft1, %1\n\t"
+                     "fdiv.s ft2, ft0, ft1"
+                     :
+                     : "r"(FP_POS_ONE), "r"(FP_POS_ZERO)
+                     : "ft0", "ft1", "ft2");
+    __asm__ volatile("csrr %0, fflags" : "=r"(result));
+    TEST("fflags DZ set", (result & 0x08) != 0, 1);
+
+    /* Read/write frm (rounding mode) */
+    __asm__ volatile("csrw frm, %0" ::"r"(0)); /* RNE */
+    __asm__ volatile("csrr %0, frm" : "=r"(result));
+    TEST("frm RNE", result, 0);
+
+    __asm__ volatile("csrw frm, %0" ::"r"(1)); /* RTZ */
+    __asm__ volatile("csrr %0, frm" : "=r"(result));
+    TEST("frm RTZ", result, 1);
+
+    __asm__ volatile("csrw frm, %0" ::"r"(2)); /* RDN */
+    __asm__ volatile("csrr %0, frm" : "=r"(result));
+    TEST("frm RDN", result, 2);
+
+    __asm__ volatile("csrw frm, %0" ::"r"(3)); /* RUP */
+    __asm__ volatile("csrr %0, frm" : "=r"(result));
+    TEST("frm RUP", result, 3);
+
+    __asm__ volatile("csrw frm, %0" ::"r"(4)); /* RMM */
+    __asm__ volatile("csrr %0, frm" : "=r"(result));
+    TEST("frm RMM", result, 4);
+
+    /* Reset to RNE */
+    __asm__ volatile("csrw frm, zero");
+
+    /* Test fcsr (combined frm and fflags) */
+    __asm__ volatile("csrw fcsr, %0" ::"r"(0x00));
+    __asm__ volatile("csrr %0, fcsr" : "=r"(result));
+    TEST("fcsr clear", result, 0);
+
+    __asm__ volatile("csrw fcsr, %0" ::"r"(0xFF)); /* Write all bits */
+    __asm__ volatile("csrr %0, fcsr" : "=r"(result));
+    TEST("fcsr mask", result, 0xFF); /* Only 8 bits are valid (3 frm + 5 fflags) */
+
+    /* Reset fcsr */
+    __asm__ volatile("csrw fcsr, zero");
 
     END_EXTENSION();
 }
@@ -1877,8 +2884,9 @@ int main(void)
     uart_printf("============================================================\n");
     uart_printf("     FROST RISC-V ISA COMPLIANCE TEST SUITE\n");
     uart_printf("============================================================\n");
-    uart_printf("  Target: RV32IMACB_Zicsr_Zicntr_Zifencei_Zicond_Zbkb_Zihintpause + M-mode\n");
+    uart_printf("  Target: RV32IMAFCB_Zicsr_Zicntr_Zifencei_Zicond_Zbkb_Zihintpause + M-mode\n");
     uart_printf("  Note:   B = Zba + Zbb + Zbs (full bit manipulation extension)\n");
+    uart_printf("  Note:   F = Single-precision floating-point\n");
     uart_printf("  Clock:  %u Hz\n", FPGA_CPU_CLK_FREQ);
     uart_printf("============================================================\n");
 
@@ -1889,6 +2897,7 @@ int main(void)
     test_m_extension();
     test_a_extension();
     test_c_extension();
+    test_f_extension();
     test_zicsr();
     test_zicntr();
     test_zifencei();

@@ -52,6 +52,7 @@ CPU_TEST_MODULES = ",".join(
         "cocotb_tests.test_directed_atomics",
         "cocotb_tests.test_directed_traps",
         "cocotb_tests.test_compressed",
+        "cocotb_tests.test_directed_multicycle",
     ]
 )
 
@@ -76,6 +77,12 @@ TEST_REGISTRY: dict[str, CocotbRunConfig] = {
         app_name="c_ext_test",
         description="C extension test",
     ),
+    "cf_ext_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="cf_ext_test",
+        description="Compressed floating-point (C.F) test",
+    ),
     "call_stress": CocotbRunConfig(
         python_test_module="cocotb_tests.test_real_program",
         hdl_toplevel_module="frost",
@@ -99,6 +106,12 @@ TEST_REGISTRY: dict[str, CocotbRunConfig] = {
         hdl_toplevel_module="frost",
         app_name="freertos_demo",
         description="FreeRTOS demo",
+    ),
+    "fpu_test": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="fpu_test",
+        description="FPU compliance test",
     ),
     "hello_world": CocotbRunConfig(
         python_test_module="cocotb_tests.test_real_program",
@@ -154,8 +167,12 @@ TEST_REGISTRY: dict[str, CocotbRunConfig] = {
         app_name="ras_stress_test",
         description="RAS stress test (calls, branches, and function pointers)",
     ),
-    # Note: uart_echo is intentionally excluded - it requires interactive user
-    # input and has no <<PASS>> marker, so it cannot be tested automatically.
+    "uart_echo": CocotbRunConfig(
+        python_test_module="cocotb_tests.test_real_program",
+        hdl_toplevel_module="frost",
+        app_name="uart_echo",
+        description="UART RX echo demo (driven via cocotb UART input)",
+    ),
 }
 
 # List of real program test names (excludes 'cpu' which uses different toplevel)
@@ -381,7 +398,7 @@ class CocotbRunner:
             # Run the simulation
             # Explicitly export PYTHONPATH so it's available to child processes (simulator)
             pythonpath = env.get("PYTHONPATH", "")
-            cmd = f"export PYTHONPATH='{pythonpath}' && make MODULE={self.python_test_module} TOPLEVEL={self.hdl_toplevel_module}"
+            cmd = f"export PYTHONPATH='{pythonpath}' && make COCOTB_TEST_MODULES='{self.python_test_module}' TOPLEVEL={self.hdl_toplevel_module}"
 
             if capture_output:
                 result = subprocess.run(
@@ -538,12 +555,12 @@ Available tests:
     parser.add_argument(
         "--testcase",
         default=None,
-        help="Specific cocotb test function to run (sets TESTCASE env var)",
+        help="Specific cocotb test function to run (sets COCOTB_TEST_FILTER env var)",
     )
     parser.add_argument(
         "--random-seed",
         default=None,
-        help="Random seed for reproducibility (sets RANDOM_SEED env var)",
+        help="Random seed for reproducibility (sets COCOTB_RANDOM_SEED env var)",
     )
 
     args = parser.parse_args()
@@ -552,9 +569,9 @@ Available tests:
     os.environ["SIM"] = args.sim
     os.environ["GUI"] = "1" if args.gui else "0"
     if args.testcase:
-        os.environ["TESTCASE"] = args.testcase
+        os.environ["COCOTB_TEST_FILTER"] = args.testcase
     if args.random_seed:
-        os.environ["RANDOM_SEED"] = args.random_seed
+        os.environ["COCOTB_RANDOM_SEED"] = args.random_seed
 
     # Get test configuration from registry
     config = TEST_REGISTRY[args.test]

@@ -53,7 +53,9 @@ module rvc_decompressor (
   localparam logic [6:0] OpcJalr = 7'b1100111;
   localparam logic [6:0] OpcBranch = 7'b1100011;
   localparam logic [6:0] OpcLoad = 7'b0000011;
+  localparam logic [6:0] OpcLoadFp = 7'b0000111;
   localparam logic [6:0] OpcStore = 7'b0100011;
+  localparam logic [6:0] OpcStoreFp = 7'b0100111;
   localparam logic [6:0] OpcOpImm = 7'b0010011;
   localparam logic [6:0] OpcOp = 7'b0110011;
 
@@ -156,7 +158,9 @@ module rvc_decompressor (
 
   logic [31:0] instr_addi4spn;  // C.ADDI4SPN
   logic [31:0] instr_lw;  // C.LW
+  logic [31:0] instr_flw;  // C.FLW
   logic [31:0] instr_sw;  // C.SW
+  logic [31:0] instr_fsw;  // C.FSW
   logic [31:0] instr_addi;  // C.ADDI / C.NOP
   logic [31:0] instr_jal;  // C.JAL
   logic [31:0] instr_li;  // C.LI
@@ -174,17 +178,21 @@ module rvc_decompressor (
   logic [31:0] instr_bnez;  // C.BNEZ
   logic [31:0] instr_slli;  // C.SLLI
   logic [31:0] instr_lwsp;  // C.LWSP
+  logic [31:0] instr_flwsp;  // C.FLWSP
   logic [31:0] instr_jr;  // C.JR
   logic [31:0] instr_mv;  // C.MV
   logic [31:0] instr_ebreak;  // C.EBREAK
   logic [31:0] instr_jalr;  // C.JALR
   logic [31:0] instr_add;  // C.ADD
   logic [31:0] instr_swsp;  // C.SWSP
+  logic [31:0] instr_fswsp;  // C.FSWSP
 
   // Quadrant 0 instructions
   assign instr_addi4spn = {imm_addi4spn, 5'd2, 3'b000, rd_prime, OpcOpImm};
   assign instr_lw = {imm_lw_sw, rs1_prime, 3'b010, rd_prime, OpcLoad};
+  assign instr_flw = {imm_lw_sw, rs1_prime, 3'b010, rd_prime, OpcLoadFp};
   assign instr_sw = {imm_lw_sw[11:5], rs2_prime, rs1_prime, 3'b010, imm_lw_sw[4:0], OpcStore};
+  assign instr_fsw = {imm_lw_sw[11:5], rs2_prime, rs1_prime, 3'b010, imm_lw_sw[4:0], OpcStoreFp};
 
   // Quadrant 1 instructions
   assign instr_addi = {imm_ci, rd_full, 3'b000, rd_full, OpcOpImm};
@@ -210,21 +218,24 @@ module rvc_decompressor (
   // Quadrant 2 instructions
   assign instr_slli = {7'b0000000, shamt, rd_full, 3'b001, rd_full, OpcOpImm};
   assign instr_lwsp = {imm_lwsp, 5'd2, 3'b010, rd_full, OpcLoad};
+  assign instr_flwsp = {imm_lwsp, 5'd2, 3'b010, rd_full, OpcLoadFp};
   assign instr_jr = {12'b0, rs1_full, 3'b000, 5'd0, OpcJalr};
   assign instr_mv = {7'b0, rs2_full, 5'd0, 3'b000, rd_full, OpcOp};
   assign instr_ebreak = 32'h0010_0073;
   assign instr_jalr = {12'b0, rs1_full, 3'b000, 5'd1, OpcJalr};
   assign instr_add = {7'b0, rs2_full, rd_full, 3'b000, rd_full, OpcOp};
   assign instr_swsp = {4'b0, imm_swsp[7:5], rs2_full, 5'd2, 3'b010, imm_swsp[4:0], OpcStore};
+  assign instr_fswsp = {4'b0, imm_swsp[7:5], rs2_full, 5'd2, 3'b010, imm_swsp[4:0], OpcStoreFp};
 
   // ===========================================================================
   // Compute one-hot select signals in parallel
   // ===========================================================================
-  logic sel_addi4spn, sel_lw, sel_sw;
+  logic sel_addi4spn, sel_lw, sel_flw, sel_sw, sel_fsw;
   logic sel_addi, sel_jal, sel_li, sel_addi16sp, sel_lui;
   logic sel_srli, sel_srai, sel_andi, sel_sub, sel_xor, sel_or, sel_and;
   logic sel_j, sel_beqz, sel_bnez;
-  logic sel_slli, sel_lwsp, sel_jr, sel_mv, sel_ebreak, sel_jalr, sel_add, sel_swsp;
+  logic sel_slli, sel_lwsp, sel_flwsp, sel_jr, sel_mv, sel_ebreak, sel_jalr, sel_add, sel_swsp;
+  logic sel_fswsp;
   logic sel_passthrough;
 
   // Helper signals for Quadrant 1 funct3=100 sub-decoding
@@ -248,7 +259,9 @@ module rvc_decompressor (
   // Quadrant 0 selects
   assign sel_addi4spn = (quadrant == 2'b00) && (funct3 == 3'b000);
   assign sel_lw = (quadrant == 2'b00) && (funct3 == 3'b010);
+  assign sel_flw = (quadrant == 2'b00) && (funct3 == 3'b011);
   assign sel_sw = (quadrant == 2'b00) && (funct3 == 3'b110);
+  assign sel_fsw = (quadrant == 2'b00) && (funct3 == 3'b111);
 
   // Quadrant 1 selects
   assign sel_addi = (quadrant == 2'b01) && (funct3 == 3'b000);
@@ -271,12 +284,14 @@ module rvc_decompressor (
   // Quadrant 2 selects
   assign sel_slli = (quadrant == 2'b10) && (funct3 == 3'b000);
   assign sel_lwsp = (quadrant == 2'b10) && (funct3 == 3'b010);
+  assign sel_flwsp = (quadrant == 2'b10) && (funct3 == 3'b011);
   assign sel_jr = q2_f100 && !q2_f100_bit12 && (rs2_full == 5'd0);
   assign sel_mv = q2_f100 && !q2_f100_bit12 && (rs2_full != 5'd0);
   assign sel_ebreak = q2_f100 && q2_f100_bit12 && (rs2_full == 5'd0) && (rd_full == 5'd0);
   assign sel_jalr = q2_f100 && q2_f100_bit12 && (rs2_full == 5'd0) && (rd_full != 5'd0);
   assign sel_add = q2_f100 && q2_f100_bit12 && (rs2_full != 5'd0);
   assign sel_swsp = (quadrant == 2'b10) && (funct3 == 3'b110);
+  assign sel_fswsp = (quadrant == 2'b10) && (funct3 == 3'b111);
 
   // Quadrant 3 (not compressed - passthrough)
   assign sel_passthrough = (quadrant == 2'b11);
@@ -304,18 +319,21 @@ module rvc_decompressor (
                        ({i_instr_compressed[12], i_instr_compressed[6:2]} == 6'b0)));
   assign illegal_srli_srai = (sel_srli || sel_srai) && i_instr_compressed[12];
   assign illegal_slli = sel_slli && (i_instr_compressed[12] || (rd_full == 5'd0));
-  assign illegal_lwsp = sel_lwsp && (rd_full == 5'd0);
+  assign illegal_lwsp = (sel_lwsp || sel_flwsp) && (rd_full == 5'd0);
   assign illegal_jr = sel_jr && (rd_full == 5'd0);
   assign illegal_mv_add = (sel_mv || sel_add) && (rd_full == 5'd0);
   assign illegal_q1_f100_reserved = q1_f100 && (q1_f100_type == 2'b11) && i_instr_compressed[12];
 
   // Reserved funct3 values in each quadrant
   assign illegal_q0_reserved = (quadrant == 2'b00) &&
-                               (funct3 != 3'b000) && (funct3 != 3'b010) && (funct3 != 3'b110);
+                               (funct3 != 3'b000) && (funct3 != 3'b010) &&
+                               (funct3 != 3'b011) && (funct3 != 3'b110) &&
+                               (funct3 != 3'b111);
   assign illegal_q1_reserved = 1'b0;  // All funct3 used in Q1
   assign illegal_q2_reserved = (quadrant == 2'b10) &&
                                (funct3 != 3'b000) && (funct3 != 3'b010) &&
-                               (funct3 != 3'b100) && (funct3 != 3'b110);
+                               (funct3 != 3'b011) && (funct3 != 3'b100) &&
+                               (funct3 != 3'b110) && (funct3 != 3'b111);
 
   assign o_illegal = illegal_addi4spn | illegal_addi16sp | illegal_lui |
                      illegal_srli_srai | illegal_slli | illegal_lwsp |
@@ -331,11 +349,13 @@ module rvc_decompressor (
   //   - 4-input final mux (2 levels, but quadrant known early from bits[1:0])
   // Total effective depth reduced since quadrant decode is very fast.
 
-  // Quadrant 0 result (3 instructions: addi4spn, lw, sw)
+  // Quadrant 0 result (5 instructions: addi4spn, lw, flw, sw, fsw)
   logic [31:0] q0_result;
   assign q0_result = ({32{sel_addi4spn}} & instr_addi4spn) |
                      ({32{sel_lw}} & instr_lw) |
-                     ({32{sel_sw}} & instr_sw);
+                     ({32{sel_flw}} & instr_flw) |
+                     ({32{sel_sw}} & instr_sw) |
+                     ({32{sel_fsw}} & instr_fsw);
 
   // Quadrant 1 result (15 instructions)
   logic [31:0] q1_result;
@@ -355,16 +375,18 @@ module rvc_decompressor (
                      ({32{sel_beqz}} & instr_beqz) |
                      ({32{sel_bnez}} & instr_bnez);
 
-  // Quadrant 2 result (8 instructions: slli, lwsp, jr, mv, ebreak, jalr, add, swsp)
+  // Quadrant 2 result (10 instructions: slli, lwsp, flwsp, jr, mv, ebreak, jalr, add, swsp, fswsp)
   logic [31:0] q2_result;
   assign q2_result = ({32{sel_slli}} & instr_slli) |
                      ({32{sel_lwsp}} & instr_lwsp) |
+                     ({32{sel_flwsp}} & instr_flwsp) |
                      ({32{sel_jr}} & instr_jr) |
                      ({32{sel_mv}} & instr_mv) |
                      ({32{sel_ebreak}} & instr_ebreak) |
                      ({32{sel_jalr}} & instr_jalr) |
                      ({32{sel_add}} & instr_add) |
-                     ({32{sel_swsp}} & instr_swsp);
+                     ({32{sel_swsp}} & instr_swsp) |
+                     ({32{sel_fswsp}} & instr_fswsp);
 
   // Final quadrant selection - quadrant bits are available immediately
   // Use simple 2-bit mux instead of one-hot for final stage

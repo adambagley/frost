@@ -183,10 +183,13 @@ class DUTInterface:
     def is_stalled(self) -> bool:
         """Check if CPU is stalled.
 
-        Uses the registered stall signal. The 1-cycle delay is compensated
-        by the instruction memory latency model in cpu_tb.sv.
+        Uses the combinational stall signal (not registered) to ensure the test
+        sees stalls immediately. This prevents duplicate instruction execution
+        when multi-cycle stalls end: with the registered signal, there's a 1-cycle
+        window where the test doesn't see the stall has ended but IF stage reads
+        the same instruction from i_instr again.
         """
-        return bool(self.dut.pipeline_stall_from_cpu.value)
+        return bool(self.dut.pipeline_stall_comb.value)
 
     def is_in_reset(self) -> bool:
         """Check if CPU is in reset."""
@@ -265,6 +268,54 @@ class DUTInterface:
         for i in range(1, 32):  # x0 always 0
             values[i] = random.randint(0, 2**32 - 1)
             self.write_register(i, values[i])
+
+        return values
+
+    def _get_fp_regfile_ram(self, ram_index: int = 0) -> Any:
+        """Get FP register file RAM instance.
+
+        Args:
+            ram_index: 0 for fs1 RAM, 1 for fs2 RAM, 2 for fs3 RAM
+
+        Returns:
+            FP register file RAM array
+        """
+        if ram_index == 0:
+            path = self.paths.fp_regfile_ram_fs1_path
+        elif ram_index == 1:
+            path = self.paths.fp_regfile_ram_fs2_path
+        else:
+            path = self.paths.fp_regfile_ram_fs3_path
+        return self._navigate_signal_path(path)
+
+    def write_fp_register(self, reg: int, value: int) -> None:
+        """Write FP register value to hardware (all 3 RAM instances).
+
+        Unlike integer registers where x0 is hardwired to zero,
+        all FP registers f0-f31 are writable.
+
+        Args:
+            reg: FP register index (0-31)
+            value: Value to write
+        """
+        HardwareAssertions.assert_register_valid(reg)
+        # Write to all 3 RAM instances for consistency
+        ram_fs1 = self._get_fp_regfile_ram(0)
+        ram_fs2 = self._get_fp_regfile_ram(1)
+        ram_fs3 = self._get_fp_regfile_ram(2)
+        ram_fs1[reg].value = value
+        ram_fs2[reg].value = value
+        ram_fs3[reg].value = value
+
+    def initialize_fp_registers(self) -> list[int]:
+        """Initialize all FP registers to zero and return the values.
+
+        FP registers start at 0 to match RTL reset state.
+        This ensures test isolation when running multiple tests.
+        """
+        values = [0] * 32
+        for i in range(32):  # All FP registers are writable (unlike x0)
+            self.write_fp_register(i, 0)
 
         return values
 

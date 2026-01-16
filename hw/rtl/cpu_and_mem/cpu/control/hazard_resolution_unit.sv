@@ -25,6 +25,10 @@
   be lost due to memory read latencies. It also generates validation signals for testbench
   verification to track instruction flow through the pipeline stages.
 
+  F extension support:
+  - FP load-use hazard detection (FLW followed by FP instruction using that register)
+  - Stall for multi-cycle FPU operations (FDIV.S, FSQRT.S)
+
   TIMING OPTIMIZATION: Load-use hazard detection is split into two parts to break the
   critical path. The "potential hazard" (dest matches source) is computed from fast
   registered signals, while cache_hit_on_load (which has a long path through forwarding,
@@ -34,9 +38,12 @@
 module hazard_resolution_unit #(
     parameter int unsigned XLEN = 32,
     parameter int unsigned NUM_PIPELINE_STAGES = 6,
-    // PC becomes valid at ID stage (stage index 2 in 0-indexed 6-stage pipeline: IF=0, PD=1, ID=2...)
+    // PC becomes valid at ID stage (stage index 2 in 0-indexed 6-stage pipeline:
+    // IF=0, PD=1, ID=2...)
     // This offset from the final stage determines when o_pc_vld asserts
-    parameter int unsigned PC_VALID_STAGE_OFFSET = 4
+    parameter int unsigned PC_VALID_STAGE_OFFSET = 4,
+    parameter int unsigned MMIO_ADDR = 32'h4000_0000,
+    parameter int unsigned MMIO_SIZE_BYTES = 32'h28
 ) (
     input logic i_clk,
     input logic i_rst,
@@ -50,6 +57,8 @@ module hazard_resolution_unit #(
     input logic i_stall_for_amo,
     // A extension: delayed AMO write enable for regfile bypass
     input logic i_amo_write_enable_delayed,
+    // F extension: stall for multi-cycle FPU operations (FDIV, FSQRT)
+    input logic i_stall_for_fpu,
     // Trap handling - lint suppression for false loop detection (see comment at o_pipeline_ctrl)
     /* verilator lint_off UNOPTFLAT */
     input logic i_trap_taken,
@@ -67,6 +76,11 @@ module hazard_resolution_unit #(
     // This one IS needed as a separate port because o_stall_excluding_amo computation
     // doesn't include i_stall_for_amo, breaking: stall → AMO check → stall_for_amo → stall
     output logic o_stall_excluding_amo,
+    // Stall signal for FPU that excludes FPU in-flight hazard.
+    // The FPU must continue computing during a RAW hazard stall to resolve the hazard.
+    output logic o_stall_for_fpu_input,
+    // One-cycle pulse to trigger MMIO read side-effects (UART RX/FIFO pop).
+    output logic o_mmio_read_pulse,
     output logic o_rst_done,
     output logic o_vld,
     output logic o_pc_vld
@@ -86,7 +100,7 @@ module hazard_resolution_unit #(
 
   // Registered control signals from previous cycle
   logic stall_registered;  // Stall signal from previous cycle
-  logic is_load_registered;  // Was previous instruction a load?
+  logic is_load_registered;  // Was previous instruction an integer load/AMO?
   logic branch_taken_registered;  // Was a branch taken in previous cycle?
   logic trap_taken_registered;  // Was a trap taken in previous cycle?
   logic mret_taken_registered;  // Was MRET executed in previous cycle?
@@ -102,22 +116,30 @@ module hazard_resolution_unit #(
   // to break critical timing path. See detailed comments below.
   logic load_potential_hazard;  // Combinational: load might cause hazard (fast path)
   logic amo_potential_hazard;  // Combinational: AMO might cause hazard (fast path)
+  logic fp_load_potential_hazard;  // Combinational: FLW might cause hazard (F extension)
   logic load_potential_hazard_reg;  // Registered: potential hazard from previous cycle
   logic amo_potential_hazard_reg;  // Registered: potential hazard from previous cycle
+  // FP load-use hazards are handled with an early, single-cycle stall.
+  logic fpu_inflight_hazard_reg;  // Registered: FPU pipeline hazard
   logic cache_hit_on_load_reg;  // Registered: cache hit from previous cycle
-  logic load_use_hazard_detected_preliminary;  // Combinational: actual hazard decision
   logic load_use_hazard_detected;  // Current instruction uses data from load
   logic stall_for_load_use_hazard;  // Need to stall due to load-use dependency
+  logic fp_load_use_hazard_early;  // Early stall for FP load-use (one-cycle bubble)
+  logic fp_load_ma_hazard;  // FP load in MA hazards (multi-cycle FP ops)
+  logic fp_load_ma_hazard_stall;  // One-cycle stall when FP load is in MA
+  logic fp_load_hazard_seen;  // Tracks FP load-use stall to avoid repeats
 
-  // Track load/AMO instructions to detect back-to-back load-use/AMO-use hazards
+  // Track load/AMO instructions to detect back-to-back load-use hazards
   // This prevents consecutive hazards from causing issues and ends hazard stalls
   always_ff @(posedge i_clk)
-    if (pipeline_reset) is_load_registered <= 1'b0;
-    else if (~pipeline_stall | stall_for_load_use_hazard)
+    if (pipeline_reset) begin
+      is_load_registered <= 1'b0;
+    end else if (~pipeline_stall | stall_for_load_use_hazard) begin
       is_load_registered <= (i_from_ex_to_ma.is_load_instruction |
                              i_from_ex_to_ma.is_amo_instruction) &
                            ~is_load_registered &
                             stall_for_load_use_hazard;
+    end
 
   // Register multiply "completing next cycle" signal to predict completion
   // This breaks the critical timing path from multiplier to stall logic
@@ -135,17 +157,113 @@ module hazard_resolution_unit #(
   // Hazard detection and stall generation
   // Priority: multiply/divide stalls take precedence over load-use stalls
   // Use optimized multiply stall for correct behavior with timing optimization
-  assign load_use_hazard_detected = load_use_hazard_detected_preliminary & ~is_load_registered;
+  // Integer/AMO load-use hazards use the registered path; FP load-use uses early stall.
+  logic load_use_hazard_int_amo;
+  assign load_use_hazard_int_amo = (load_potential_hazard_reg && ~cache_hit_on_load_reg) ||
+                                   amo_potential_hazard_reg;
+
+  assign load_use_hazard_detected = load_use_hazard_int_amo && ~is_load_registered;
   assign stall_for_load_use_hazard = load_use_hazard_detected &
                                      ~stall_for_multiply_divide_optimized;
+  // FP load-use: insert a one-cycle bubble so the load data is stable before EX capture.
+  assign fp_load_use_hazard_early = fp_load_potential_hazard && ~fp_load_hazard_seen;
+  assign fp_load_ma_hazard_stall = fp_load_ma_hazard && ~fp_load_hazard_seen;
+
+  // Track FP load hazards even during the bubble so we don't stall repeatedly.
+  always_ff @(posedge i_clk)
+    if (pipeline_reset) begin
+      fp_load_hazard_seen <= 1'b0;
+    end else if (~pipeline_stall || fp_load_use_hazard_early || fp_load_ma_hazard_stall) begin
+      fp_load_hazard_seen <= fp_load_potential_hazard | fp_load_ma_hazard;
+    end
+
+  // Gate the FPU stall by whether the instruction in EX is an FP compute operation.
+  // This matches the integer multiply/divide pattern where stall is gated by is_divide.
+  // Without this gating, the FPU stall would block pipeline advancement even for non-FP
+  // instructions, preventing results in MA/WB from being written to the regfile.
+  // Use is_fp_compute (not fpu_entering_is_pipelined) to include ALL FP ops that use the
+  // FPU including single-cycle operations like FMV.W.X which still need a few cycles.
+  logic fpu_stall_gated;
+  assign fpu_stall_gated = i_from_id_to_ex.is_fp_compute & i_stall_for_fpu;
+
+  // ===========================================================================
+  // CSR Read Stall (for timing optimization)
+  // ===========================================================================
+  // CSR read data is registered in csr_file.sv to break timing path.
+  // This requires a one-cycle stall for CSR instructions to wait for data.
+  // The csr_read_waiting flag tracks whether we've waited one cycle for this
+  // CSR instruction. It's set when we first see a CSR and cleared when the
+  // instruction advances (stall releases).
+  logic csr_read_waiting;
+  logic stall_for_csr_read;
+
+  always_ff @(posedge i_clk)
+    if (pipeline_reset) csr_read_waiting <= 1'b0;
+    else if (i_from_id_to_ex.is_csr_instruction && ~csr_read_waiting) csr_read_waiting <= 1'b1;
+    else csr_read_waiting <= 1'b0;
+
+  // Stall on the first cycle of CSR instruction (before data is ready)
+  assign stall_for_csr_read = i_from_id_to_ex.is_csr_instruction && ~csr_read_waiting;
+
+  // MMIO load handling: insert a two-cycle bubble and pulse read side-effects once.
+  logic mmio_load_in_ma;
+  logic mmio_load_stall;
+  logic mmio_read_pulse;
+  logic [1:0] mmio_stall_count;
+  assign mmio_load_in_ma =
+      (i_from_ex_to_ma.is_load_instruction | i_from_ex_to_ma.is_lr |
+       i_from_ex_to_ma.is_fp_load) &&
+      (i_from_ex_to_ma.data_memory_address >= MMIO_ADDR) &&
+      (i_from_ex_to_ma.data_memory_address < (MMIO_ADDR + MMIO_SIZE_BYTES));
+  assign mmio_load_stall = mmio_load_in_ma && (mmio_stall_count < 2);
+  assign mmio_read_pulse = mmio_load_in_ma && (mmio_stall_count == 2'b0);
+
+  always_ff @(posedge i_clk)
+    if (pipeline_reset || pipeline_flush) begin
+      mmio_stall_count <= 2'b0;
+    end else if (~pipeline_stall) begin
+      mmio_stall_count <= 2'b0;
+    end else if (mmio_load_in_ma && (mmio_stall_count < 2)) begin
+      mmio_stall_count <= mmio_stall_count + 1'b1;
+    end
 
   // Combine all stall sources (before trap/mret gating, for trap unit to use without loop)
   // Use optimized multiply stall for correct behavior with timing optimization
+  // F extension: fpu_inflight_hazard uses combinational signal since it compares registered values
+  // and needs to clear immediately when the FPU operation completes
   logic stall_sources;
   assign stall_sources = stall_for_multiply_divide_optimized |
                          stall_for_load_use_hazard |
+                         fp_load_use_hazard_early |
+                         fp_load_ma_hazard_stall |
                          i_stall_for_amo |
+                         fpu_stall_gated |
+                         fpu_inflight_hazard |
+                         fpu_single_to_pipelined_hazard |
+                         fp_to_int_to_int_to_fp_hazard |
+                         csr_fflags_read_hazard |
+                         stall_for_csr_read |
+                         mmio_load_stall |
                          i_stall_for_wfi;
+
+  // Stall sources excluding CSR read stall - used for trap check.
+  // When a trap fires, the CSR instruction will be flushed anyway, so blocking
+  // the trap for CSR read data is unnecessary. This allows traps to fire
+  // immediately when interrupt_pending becomes 1, without waiting for a
+  // potentially stalling CSR instruction to complete.
+  logic stall_sources_for_trap;
+  assign stall_sources_for_trap = stall_for_multiply_divide_optimized |
+                                  stall_for_load_use_hazard |
+                                  fp_load_use_hazard_early |
+                                  fp_load_ma_hazard_stall |
+                                  i_stall_for_amo |
+                                  fpu_stall_gated |
+                                  fpu_inflight_hazard |
+                                  fpu_single_to_pipelined_hazard |
+                                  fp_to_int_to_int_to_fp_hazard |
+                                  csr_fflags_read_hazard |
+                                  mmio_load_stall |
+                                  i_stall_for_wfi;
 
   // ===========================================================================
   // Internal Pipeline Control Signal Generation
@@ -221,7 +339,8 @@ module hazard_resolution_unit #(
   // CRITICAL PATH OPTIMIZATION:
   // The original implementation computed cache_hit_on_load and combined it with
   // hazard conditions in a single cycle, creating a long combinational path:
-  //   rs1 → regfile → forwarding → address_calc → cache_lookup → cache_hit → hazard_detect → register
+  //   rs1 → regfile → forwarding → address_calc → cache_lookup →
+  //   cache_hit → hazard_detect → register
   //
   // The optimized approach splits this into:
   //   Cycle N: Compute potential_hazard (fast) and cache_hit (slow) in PARALLEL, register both
@@ -252,26 +371,200 @@ module hazard_resolution_unit #(
       i_from_id_to_ex.instruction.dest_reg != 0 &&
       dest_matches_source;
 
+  // F extension: FLW load-use hazard detection
+  // FLW writes to FP register, so we check if next instruction uses that FP register
+  // FP source registers use the same field positions as integer (rs1/rs2) plus rs3 for FMA
+  logic fp_dest_matches_source;
+  assign fp_dest_matches_source =
+      i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.source_reg_1_early ||
+      i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.source_reg_2_early ||
+      i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.fp_source_reg_3_early;
+
+  assign fp_load_potential_hazard = i_from_id_to_ex.is_fp_load && fp_dest_matches_source;
+
+  // FP source registers from PD stage (used by multiple hazard checks)
+  logic [4:0] fpu_src1, fpu_src2, fpu_src3;
+  assign fpu_src1 = i_from_pd_to_id.source_reg_1_early;
+  assign fpu_src2 = i_from_pd_to_id.source_reg_2_early;
+  assign fpu_src3 = i_from_pd_to_id.fp_source_reg_3_early;
+
+  // F extension: Pipelined FPU RAW hazard detection
+  // Conservative timing-friendly rule: if ANY FP op is in flight, stall any FP consumer.
+  // This removes wide register-compare trees from the critical path. FP throughput drops,
+  // but correctness is preserved (extra stalls only).
+  logic fpu_inflight_hazard;
+  logic fpu_inflight_any;
+
+  assign fpu_inflight_any =
+      (i_from_ex_comb.fpu_inflight_dest_1 != 5'b0) ||
+      (i_from_ex_comb.fpu_inflight_dest_2 != 5'b0) ||
+      (i_from_ex_comb.fpu_inflight_dest_3 != 5'b0) ||
+      (i_from_ex_comb.fpu_inflight_dest_4 != 5'b0) ||
+      (i_from_ex_comb.fpu_inflight_dest_5 != 5'b0) ||
+      (i_from_ex_comb.fpu_inflight_dest_6 != 5'b0);
+
+  // Also stall on the cycle a pipelined FP op enters EX (before inflight dest is recorded).
+  // Gate by ~stall_registered: only detect on the cycle the instruction actually advances.
+  logic fpu_entering_ex_hazard;
+  assign fpu_entering_ex_hazard = i_from_id_to_ex.is_pipelined_fp_op && ~stall_registered;
+
+  // Check if the instruction in PD stage is an FP consumer (reads from FP registers).
+  // Only FP consumer instructions should trigger hazard detection against in-flight FP dests.
+  // Without this check, non-FP instructions (e.g., integer ops in TEST() macro) that happen
+  // to have register numbers matching in-flight FP destinations would cause spurious stalls.
+  logic is_incoming_fp_consumer;
+  assign is_incoming_fp_consumer =
+      (i_from_pd_to_id.instruction.opcode ==
+       riscv_pkg::OPC_OP_FP) ||
+      (i_from_pd_to_id.instruction.opcode ==
+       riscv_pkg::OPC_FMADD) ||
+      (i_from_pd_to_id.instruction.opcode ==
+       riscv_pkg::OPC_FMSUB) ||
+      (i_from_pd_to_id.instruction.opcode ==
+       riscv_pkg::OPC_FNMSUB) ||
+      (i_from_pd_to_id.instruction.opcode ==
+       riscv_pkg::OPC_FNMADD) ||
+      (i_from_pd_to_id.instruction.opcode ==
+       riscv_pkg::OPC_STORE_FP);
+
+  assign fpu_inflight_hazard = is_incoming_fp_consumer &&
+                               (fpu_inflight_any || fpu_entering_ex_hazard);
+
+  // ===========================================================================
+  // FP Single-Cycle to Pipelined Hazard Detection
+  // ===========================================================================
+  // When a TRUE SINGLE-CYCLE FP op (FSGNJ*) is in EX and a PIPELINED FP op
+  // (FADD, FSUB, FMUL, FMA) in ID depends on it, insert a stall cycle.
+  // This is necessary because the registered forwarding signals have OLD values
+  // at the posedge when the pipelined op captures operands.
+  //
+  // NOTE: Multi-cycle ops (FMV.W.X, FCVT, FMIN, FMAX, etc.) are NOT included here
+  // because they cause stalls via convert_busy or compare_busy. By the time that
+  // stall releases and the consumer enters EX, the producer has moved to MA and
+  // normal forwarding handles it.
+  logic fpu_single_to_pipelined_hazard;
+  logic fp_op_in_ex_is_single_cycle;
+  logic fp_op_in_id_is_pipelined;
+  logic single_cycle_dest_matches_pipelined_src;
+  logic incoming_int_to_fp;
+  logic fp_to_int_to_int_to_fp_hazard;
+
+  // Check if instruction in EX is a TRUE single-cycle FP op that writes to FP register.
+  // Only FSGNJ* are true single-cycle - they don't use any busy signal and complete
+  // in one cycle without stalling the pipeline.
+  assign fp_op_in_ex_is_single_cycle = i_from_id_to_ex.is_fp_compute &&
+      (i_from_id_to_ex.instruction_operation == riscv_pkg::FSGNJ_S ||
+       i_from_id_to_ex.instruction_operation == riscv_pkg::FSGNJN_S ||
+       i_from_id_to_ex.instruction_operation == riscv_pkg::FSGNJX_S);
+
+  // Check if instruction in ID (about to enter EX) is a pipelined FP op
+  assign fp_op_in_id_is_pipelined =
+      (i_from_pd_to_id.instruction.opcode == riscv_pkg::OPC_OP_FP &&
+       (i_from_pd_to_id.instruction.funct7 == 7'b0000000 ||   // FADD.S
+      i_from_pd_to_id.instruction.funct7 == 7'b0000100 ||  // FSUB.S
+      i_from_pd_to_id.instruction.funct7 == 7'b0001000)) ||  // FMUL.S
+      (i_from_pd_to_id.instruction.opcode == riscv_pkg::OPC_FMADD) ||
+      (i_from_pd_to_id.instruction.opcode == riscv_pkg::OPC_FMSUB) ||
+      (i_from_pd_to_id.instruction.opcode == riscv_pkg::OPC_FNMSUB) ||
+      (i_from_pd_to_id.instruction.opcode == riscv_pkg::OPC_FNMADD);
+
+  // Check if the single-cycle op's dest matches any of the pipelined op's sources
+  assign single_cycle_dest_matches_pipelined_src =
+      i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.source_reg_1_early ||
+      i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.source_reg_2_early ||
+      i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.fp_source_reg_3_early;
+
+  // Detect hazard: single-cycle FP in EX, pipelined FP in ID, with RAW dependency
+  // Gate by ~stall_registered to only trigger once (not during stall)
+  assign fpu_single_to_pipelined_hazard = fp_op_in_ex_is_single_cycle &&
+                                          fp_op_in_id_is_pipelined &&
+                                          single_cycle_dest_matches_pipelined_src &&
+                                          ~stall_registered;
+
+  // FP-to-int -> int-to-fp (FMV.W.X/FCVT.S.W) hazard on integer register
+  assign incoming_int_to_fp =
+      (i_from_pd_to_id.instruction.opcode == riscv_pkg::OPC_OP_FP) && (
+      (i_from_pd_to_id.instruction.funct7[6:2] == 5'b11010) ||
+      (i_from_pd_to_id.instruction.funct7[6:2] == 5'b11110 &&
+       i_from_pd_to_id.instruction.funct3 == 3'b000));
+
+  assign fp_to_int_to_int_to_fp_hazard =
+      i_from_id_to_ex.is_fp_to_int &&
+      incoming_int_to_fp &&
+      (i_from_id_to_ex.instruction.dest_reg ==
+       i_from_pd_to_id.source_reg_1_early) &&
+      ~stall_registered;
+
+  // ===========================================================================
+  // FP Load (MA) -> Multi-Cycle FP Op (ID) Hazard
+  // ===========================================================================
+  // Multi-cycle FP ops capture operands at posedge. When an FLW is in MA and the
+  // consumer is still in ID, insert a single bubble so the load data is stable
+  // before the consumer enters EX.
+  logic fp_op_in_id_is_multicycle;
+  logic fp_load_ma_matches_src;
+
+  assign fp_op_in_id_is_multicycle = fp_op_in_id_is_pipelined ||
+      (i_from_pd_to_id.instruction.opcode == riscv_pkg::OPC_OP_FP &&
+       (i_from_pd_to_id.instruction.funct7 == 7'b0001100 ||  // FDIV.S
+      i_from_pd_to_id.instruction.funct7 == 7'b0101100));  // FSQRT.S
+
+  assign fp_load_ma_matches_src = i_from_ex_to_ma.is_fp_load &&
+      (i_from_ex_to_ma.fp_dest_reg == fpu_src1 ||
+       i_from_ex_to_ma.fp_dest_reg == fpu_src2 ||
+       i_from_ex_to_ma.fp_dest_reg == fpu_src3);
+
+  assign fp_load_ma_hazard = fp_op_in_id_is_multicycle && fp_load_ma_matches_src;
+
+  // ===========================================================================
+  // CSR fflags/fcsr Read Hazard Detection (F extension)
+  // ===========================================================================
+  // When a CSR read of fflags/frm/fcsr is in EX and an FP instruction that
+  // generates exception flags is in MA, we must stall. The FP instruction's
+  // flags won't be accumulated in the CSR until it reaches WB, so reading
+  // fflags in EX would get stale data.
+  //
+  // Hazard scenario:
+  //   Cycle N: FSQRT completes EX -> MA, CSRR fflags enters EX (reads stale fflags!)
+  //   Cycle N+1: FSQRT MA -> WB (flags accumulated), CSRR EX -> MA
+  //   Fix: Stall CSRR in EX until FSQRT reaches WB
+  logic csr_fflags_read_hazard;
+  logic is_csr_fflags_read;
+  logic fp_flags_producer_in_ma;
+
+  // Detect CSR read of fflags (0x001), frm (0x002), or fcsr (0x003)
+  assign is_csr_fflags_read = i_from_id_to_ex.is_csr_instruction &&
+      (i_from_id_to_ex.csr_address == riscv_pkg::CsrFflags ||
+       i_from_id_to_ex.csr_address == riscv_pkg::CsrFrm ||
+       i_from_id_to_ex.csr_address == riscv_pkg::CsrFcsr);
+
+  // Detect FP instruction in MA that produces flags (arithmetic ops, not FMV)
+  // Most FP compute ops produce flags except FMV.W.X, FMV.X.W, FSGNJ*, FCLASS
+  // For simplicity, we check fp_regfile_write_enable which covers most cases
+  // where flags matter (arithmetic results going to FP regfile)
+  assign fp_flags_producer_in_ma = i_from_ex_to_ma.is_fp_instruction &&
+      (i_from_ex_to_ma.fp_regfile_write_enable || i_from_ex_to_ma.is_fp_to_int);
+
+  // Stall CSR fflags/fcsr read when FP instruction in MA will produce flags
+  // Gate by ~stall_registered to only trigger once (not during stall cycle)
+  assign csr_fflags_read_hazard = is_csr_fflags_read && fp_flags_producer_in_ma &&
+                                   ~stall_registered;
+
   // Register the potential hazards and cache hit signal
   // cache_hit_on_load is the SLOW signal (long combinational path), but it now ends at a register
   always_ff @(posedge i_clk) begin
     if (pipeline_reset || pipeline_flush) begin
       load_potential_hazard_reg <= 1'b0;
       amo_potential_hazard_reg <= 1'b0;
+      fpu_inflight_hazard_reg <= 1'b0;
       cache_hit_on_load_reg <= 1'b0;
     end else if (~pipeline_stall) begin
       load_potential_hazard_reg <= load_potential_hazard;
       amo_potential_hazard_reg <= amo_potential_hazard;
+      fpu_inflight_hazard_reg <= fpu_inflight_hazard;
       cache_hit_on_load_reg <= i_from_cache.cache_hit_on_load;
     end
   end
-
-  // Final hazard decision (SHORT PATH - just one AND gate after registers)
-  // Load-use hazard: potential hazard existed AND cache didn't hit (can't forward from cache)
-  // AMO-use hazard: always stall (no cache shortcut, result not available until READ phase)
-  assign load_use_hazard_detected_preliminary =
-      (load_potential_hazard_reg && ~cache_hit_on_load_reg) ||
-      amo_potential_hazard_reg;
 
   // Validation signals for testbench - track instruction progress through pipeline
   // This shift register moves a '1' through each stage, indicating valid instruction flow.
@@ -299,8 +592,12 @@ module hazard_resolution_unit #(
   assign o_pipeline_ctrl.flush = pipeline_flush;
   assign o_pipeline_ctrl.stall_registered = stall_registered;
   assign o_pipeline_ctrl.stall_for_load_use_hazard = stall_for_load_use_hazard;
-  // Stall check for trap unit - doesn't include trap/mret gating to break combinatorial loop
-  assign o_pipeline_ctrl.stall_for_trap_check = stall_sources;
+  assign o_pipeline_ctrl.stall_for_fp_load_ma_hazard = fp_load_ma_hazard_stall;
+  // F extension: expose FPU inflight hazard for EX stage to detect stall exit
+  assign o_pipeline_ctrl.stall_for_fpu_inflight_hazard = fpu_inflight_hazard;
+  // Stall check for trap unit - doesn't include trap/mret gating to break combinatorial loop.
+  // Uses stall_sources_for_trap which excludes CSR stall (CSR will be flushed on trap anyway).
+  assign o_pipeline_ctrl.stall_for_trap_check = stall_sources_for_trap;
   // Expose raw hazard detection for forwarding unit.
   assign o_pipeline_ctrl.load_use_hazard_detected = load_use_hazard_detected;
   // Stall sources excluding AMO - breaks combinational loop with AMO unit.
@@ -309,7 +606,30 @@ module hazard_resolution_unit #(
   // NOTE: This is a separate output port (not through packed struct) to avoid false loop detection.
   assign o_stall_excluding_amo = stall_for_multiply_divide_optimized |
                                   load_use_hazard_detected |
+                                  fp_load_use_hazard_early |
+                                  fp_load_ma_hazard_stall |
+                                  i_stall_for_fpu |
+                                  fpu_inflight_hazard |
+                                  fp_to_int_to_int_to_fp_hazard |
+                                  csr_fflags_read_hazard |
+                                  stall_for_csr_read |
+                                  mmio_load_stall |
                                   i_stall_for_wfi;
+  // Stall for FPU input - excludes fpu_inflight_hazard so FPU can continue computing
+  // to resolve the hazard. Similar to how integer multiply continues during multiply stall.
+  // Note: Do NOT gate by trap/mret to avoid combinational loop. FPU will be reset on flush anyway.
+  assign o_stall_for_fpu_input = stall_for_multiply_divide_optimized |
+                                  stall_for_load_use_hazard |
+                                  fp_load_use_hazard_early |
+                                  fp_load_ma_hazard_stall |
+                                  i_stall_for_amo |
+                                  i_stall_for_fpu |
+                                  fp_to_int_to_int_to_fp_hazard |
+                                  stall_for_csr_read |
+                                  mmio_load_stall |
+                                  i_stall_for_wfi;
+  // MMIO read pulse for side-effecting registers (UART RX, FIFO).
+  assign o_mmio_read_pulse = mmio_read_pulse;
   // Force regfile write when AMO result is ready (bypass stall_registered)
   assign o_pipeline_ctrl.amo_wb_write_enable = i_amo_write_enable_delayed;
   // Expose registered trap/mret signals for IF stage timing optimization

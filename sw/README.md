@@ -29,6 +29,8 @@ sw/
     ├── strings_test/ # String library test suite
     ├── memory_test/  # Memory allocator test suite
     ├── c_ext_test/   # C extension (compressed) instruction test
+    ├── cf_ext_test/  # Compressed floating-point (C.FLW/C.FSW) test
+    ├── fpu_test/     # FPU compliance test suite (F extension)
     ├── call_stress/  # Function call stress test
     ├── spanning_test/# Instruction spanning boundary test
     ├── uart_echo/    # UART RX echo demo with interactive commands
@@ -554,15 +556,16 @@ include ../../common/common.mk
 
 ### Supported RISC-V Extensions
 
-**ISA: RV32IMACB** plus additional extensions
+**ISA: RV32IMAFCB** plus additional extensions
 
 | Extension       | Description                                                                        |
 |-----------------|------------------------------------------------------------------------------------|
 | **RV32I**       | Base integer instruction set                                                       |
 | **M**           | Integer multiply/divide                                                            |
 | **A**           | Atomic memory operations (LR.W, SC.W, AMO instructions)                            |
-| **B**           | Bit manipulation (B = Zba + Zbb + Zbs)                                             |
+| **F**           | Single-precision floating-point (32-bit IEEE 754)                                  |
 | **C**           | Compressed instructions (16-bit encodings for reduced code size)                   |
+| **B**           | Bit manipulation (B = Zba + Zbb + Zbs)                                             |
 | **Zba**         | Address generation (sh1add, sh2add, sh3add) - part of B                            |
 | **Zbb**         | Basic bit manipulation (clz, ctz, cpop, min/max, sext, zext, rotations, orc.b, rev8) - part of B |
 | **Zbs**         | Single-bit operations (bset, bclr, binv, bext + immediate variants) - part of B    |
@@ -612,7 +615,7 @@ These markers are distinct from individual test output (like `PASS: test_name`) 
 
 ### Other Details
 
-- **ABI**: ILP32 (32-bit integers, longs, and pointers)
-- **No floating point**: Software emulation only if needed
+- **ABI**: ILP32F (32-bit integers, longs, pointers; hardware single-precision float)
+- **Floating-point**: Hardware F extension (single-precision IEEE 754)
 - **No OS/libc**: Fully bare-metal, minimal dependencies
 - **Optimization**: Default `-O3` (can be overridden per-app, e.g., isa_test uses `-O2`)

@@ -65,11 +65,21 @@ class Opcode(IntEnum):
     STORE = 0x23
     ALU_IMM = 0x13
     ALU_REG = 0x33
+    LUI = 0x37  # Load Upper Immediate
+    AUIPC = 0x17  # Add Upper Immediate to PC
     AMO = 0x2F  # A extension (atomics)
     BRANCH = 0x63
     JALR = 0x67
     JAL = 0x6F
     SYSTEM = 0x73  # CSR instructions (Zicsr)
+    # F extension (single-precision floating-point)
+    LOAD_FP = 0x07  # FLW
+    STORE_FP = 0x27  # FSW
+    FMADD = 0x43  # FMADD.S
+    FMSUB = 0x47  # FMSUB.S
+    FNMSUB = 0x4B  # FNMSUB.S
+    FNMADD = 0x4F  # FNMADD.S
+    OP_FP = 0x53  # FADD.S, FSUB.S, FMUL.S, etc.
 
 
 class Funct3(IntEnum):
@@ -119,6 +129,24 @@ class Funct7(IntEnum):
     DEFAULT = 0x00
     ALTERNATE = 0x20  # Used for SUB, SRA
     MULDIV = 0x01
+
+
+class FPFunct7(IntEnum):
+    """7-bit function codes for F extension operations."""
+
+    FADD_S = 0x00
+    FSUB_S = 0x04
+    FMUL_S = 0x08
+    FDIV_S = 0x0C
+    FSQRT_S = 0x2C  # rs2=0
+    FSGNJ_S = 0x10  # funct3 selects FSGNJ/FSGNJN/FSGNJX
+    FMIN_MAX_S = 0x14  # funct3 selects FMIN/FMAX
+    FCVT_W_S = 0x60  # FP to int, rs2=0 for W, rs2=1 for WU
+    FCVT_S_W = 0x68  # Int to FP, rs2=0 for W, rs2=1 for WU
+    FMV_X_W = 0x70  # Move FP to int (rs2=0, funct3=0)
+    FCLASS_S = 0x70  # Classify (rs2=0, funct3=1)
+    FMV_W_X = 0x78  # Move int to FP (rs2=0, funct3=0)
+    FCMP_S = 0x50  # Compare, funct3 selects FEQ/FLT/FLE
 
 
 class Funct5(IntEnum):
@@ -390,6 +418,107 @@ class AMOType(InstructionEncoder):
         )
 
 
+class R4Type(InstructionEncoder):
+    """R4-type instruction format encoder (F extension - FMA operations).
+
+    Format: rs3[31:27] | fmt[26:25] | rs2[24:20] | rs1[19:15] | rm[14:12] | rd[11:7] | opcode[6:0]
+    Used for: fused multiply-add operations (FMADD.S, FMSUB.S, FNMADD.S, FNMSUB.S)
+
+    Note: fmt=00 for single-precision (S), rm is rounding mode (typically 111=dynamic)
+    """
+
+    @staticmethod
+    def encode(
+        source_register_3: int,
+        source_register_2: int,
+        source_register_1: int,
+        rounding_mode: int,
+        destination_register: int,
+        opcode: int,
+        fmt: int = 0,
+    ) -> int:
+        """Encode R4-type instruction into 32-bit word.
+
+        Args:
+            source_register_3: rs3 register (addend for FMA)
+            source_register_2: rs2 register (multiplier)
+            source_register_1: rs1 register (multiplicand)
+            rounding_mode: Rounding mode (0-4, or 7 for dynamic)
+            destination_register: rd register
+            opcode: Instruction opcode
+            fmt: Format (0=S single-precision)
+
+        Returns:
+            32-bit encoded instruction
+        """
+        return InstructionEncoder._pack_bits(
+            (source_register_3, 27, 0x1F),  # rs3[31:27]
+            (fmt, 25, 0x3),  # fmt[26:25]
+            (source_register_2, 20, 0x1F),  # rs2[24:20]
+            (source_register_1, 15, 0x1F),  # rs1[19:15]
+            (rounding_mode, 12, 0x7),  # rm[14:12]
+            (destination_register, 7, 0x1F),  # rd[11:7]
+            (opcode, 0, 0x7F),  # opcode[6:0]
+        )
+
+
+class FPType(InstructionEncoder):
+    """F extension instruction format encoder.
+
+    Uses R-type format with funct7 encoding the operation.
+    Format: funct7[31:25] | rs2[24:20] | rs1[19:15] | rm[14:12] | rd[11:7] | opcode[6:0]
+    """
+
+    @staticmethod
+    def encode(
+        funct7_code: int,
+        source_register_2: int,
+        source_register_1: int,
+        rounding_mode: int,
+        destination_register: int,
+    ) -> int:
+        """Encode FP R-type instruction into 32-bit word."""
+        return InstructionEncoder._pack_bits(
+            (funct7_code, 25, 0x7F),
+            (source_register_2, 20, 0x1F),
+            (source_register_1, 15, 0x1F),
+            (rounding_mode, 12, 0x7),
+            (destination_register, 7, 0x1F),
+            (Opcode.OP_FP, 0, 0x7F),
+        )
+
+
+class UType(InstructionEncoder):
+    """U-type instruction format encoder.
+
+    Format: imm[31:12][31:12] | rd[11:7] | opcode[6:0]
+    Used for: LUI (Load Upper Immediate), AUIPC (Add Upper Immediate to PC)
+    The 20-bit immediate is placed in the upper 20 bits of the destination register.
+    """
+
+    @staticmethod
+    def encode(
+        immediate_20bit: int,
+        destination_register: int,
+        opcode: int,
+    ) -> int:
+        """Encode U-type instruction into 32-bit word.
+
+        Args:
+            immediate_20bit: 20-bit immediate value (placed in bits [31:12])
+            destination_register: Destination register (rd)
+            opcode: Instruction opcode (LUI=0x37, AUIPC=0x17)
+
+        Returns:
+            32-bit encoded instruction
+        """
+        return InstructionEncoder._pack_bits(
+            (immediate_20bit, 12, 0xFFFFF),  # imm[31:12]
+            (destination_register, 7, 0x1F),  # rd[11:7]
+            (opcode, 0, 0x7F),  # opcode[6:0]
+        )
+
+
 # Convenience functions for encoding instructions (maintain API compatibility)
 def enc_r(funct7: int, rs2: int, rs1: int, funct3: int, rd: int) -> int:
     """Encode R-type register-register instruction (opcode 0x33 - ALU operations)."""
@@ -424,6 +553,39 @@ def enc_b(rs2: int, rs1: int, funct3: int, branch_offset: int) -> int:
 def enc_j(rd: int, jump_offset: int) -> int:
     """Encode J-type jump-and-link instruction (opcode 0x6F - JAL)."""
     return JType.encode(jump_offset, rd, Opcode.JAL)
+
+
+def enc_lui(rd: int, immediate_20bit: int) -> int:
+    """Encode LUI (Load Upper Immediate) instruction (opcode 0x37).
+
+    LUI places the 20-bit immediate value into the upper 20 bits of rd,
+    filling the lower 12 bits with zeros.
+
+    Args:
+        rd: Destination register
+        immediate_20bit: 20-bit immediate value (upper 20 bits of result)
+
+    Returns:
+        32-bit encoded instruction
+    """
+    return UType.encode(immediate_20bit & 0xFFFFF, rd, Opcode.LUI)
+
+
+def enc_auipc(rd: int, immediate_20bit: int) -> int:
+    """Encode AUIPC (Add Upper Immediate to PC) instruction (opcode 0x17).
+
+    AUIPC forms a 32-bit offset from the 20-bit immediate (filling low 12 bits
+    with zeros), adds it to the PC of the AUIPC instruction, and stores the
+    result in rd.
+
+    Args:
+        rd: Destination register
+        immediate_20bit: 20-bit immediate value
+
+    Returns:
+        32-bit encoded instruction
+    """
+    return UType.encode(immediate_20bit & 0xFFFFF, rd, Opcode.AUIPC)
 
 
 def enc_fence() -> int:
@@ -685,3 +847,144 @@ def enc_wfi() -> int:
         This is imm[11:0]=0x105
     """
     return IType.encode(0x105, 0, 0, 0, Opcode.SYSTEM)
+
+
+# ============================================================================
+# F extension (single-precision floating-point) encoder functions
+# ============================================================================
+
+
+def enc_flw(rd: int, rs1: int, imm: int) -> int:
+    """Encode FLW (Load Float Word) instruction.
+
+    Loads a 32-bit value from memory at rs1+imm into FP register rd.
+    """
+    return IType.encode(imm & 0xFFF, rs1, Funct3.WORD, rd, Opcode.LOAD_FP)
+
+
+def enc_fsw(rs2: int, rs1: int, imm: int) -> int:
+    """Encode FSW (Store Float Word) instruction.
+
+    Stores FP register rs2 to memory at rs1+imm.
+    """
+    return SType.encode(imm, rs2, rs1, Funct3.WORD, Opcode.STORE_FP)
+
+
+def enc_fadd_s(rd: int, rs1: int, rs2: int, rm: int = 7) -> int:
+    """Encode FADD.S (Floating-point Add Single) instruction."""
+    return FPType.encode(FPFunct7.FADD_S, rs2, rs1, rm, rd)
+
+
+def enc_fsub_s(rd: int, rs1: int, rs2: int, rm: int = 7) -> int:
+    """Encode FSUB.S (Floating-point Subtract Single) instruction."""
+    return FPType.encode(FPFunct7.FSUB_S, rs2, rs1, rm, rd)
+
+
+def enc_fmul_s(rd: int, rs1: int, rs2: int, rm: int = 7) -> int:
+    """Encode FMUL.S (Floating-point Multiply Single) instruction."""
+    return FPType.encode(FPFunct7.FMUL_S, rs2, rs1, rm, rd)
+
+
+def enc_fdiv_s(rd: int, rs1: int, rs2: int, rm: int = 7) -> int:
+    """Encode FDIV.S (Floating-point Divide Single) instruction."""
+    return FPType.encode(FPFunct7.FDIV_S, rs2, rs1, rm, rd)
+
+
+def enc_fsqrt_s(rd: int, rs1: int, rm: int = 7) -> int:
+    """Encode FSQRT.S (Floating-point Square Root Single) instruction."""
+    return FPType.encode(FPFunct7.FSQRT_S, 0, rs1, rm, rd)
+
+
+def enc_fmadd_s(rd: int, rs1: int, rs2: int, rs3: int, rm: int = 7) -> int:
+    """Encode FMADD.S: rd = rs1 * rs2 + rs3."""
+    return R4Type.encode(rs3, rs2, rs1, rm, rd, Opcode.FMADD)
+
+
+def enc_fmsub_s(rd: int, rs1: int, rs2: int, rs3: int, rm: int = 7) -> int:
+    """Encode FMSUB.S: rd = rs1 * rs2 - rs3."""
+    return R4Type.encode(rs3, rs2, rs1, rm, rd, Opcode.FMSUB)
+
+
+def enc_fnmadd_s(rd: int, rs1: int, rs2: int, rs3: int, rm: int = 7) -> int:
+    """Encode FNMADD.S: rd = -(rs1 * rs2) - rs3."""
+    return R4Type.encode(rs3, rs2, rs1, rm, rd, Opcode.FNMADD)
+
+
+def enc_fnmsub_s(rd: int, rs1: int, rs2: int, rs3: int, rm: int = 7) -> int:
+    """Encode FNMSUB.S: rd = -(rs1 * rs2) + rs3."""
+    return R4Type.encode(rs3, rs2, rs1, rm, rd, Opcode.FNMSUB)
+
+
+def enc_fsgnj_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FSGNJ.S (Sign Inject): rd = |rs1| with sign of rs2."""
+    return FPType.encode(FPFunct7.FSGNJ_S, rs2, rs1, 0, rd)
+
+
+def enc_fsgnjn_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FSGNJN.S (Sign Inject Negated): rd = |rs1| with negated sign of rs2."""
+    return FPType.encode(FPFunct7.FSGNJ_S, rs2, rs1, 1, rd)
+
+
+def enc_fsgnjx_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FSGNJX.S (Sign Inject XOR): rd = rs1 with sign XORed with rs2's sign."""
+    return FPType.encode(FPFunct7.FSGNJ_S, rs2, rs1, 2, rd)
+
+
+def enc_fmin_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FMIN.S (Floating-point Minimum Single) instruction."""
+    return FPType.encode(FPFunct7.FMIN_MAX_S, rs2, rs1, 0, rd)
+
+
+def enc_fmax_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FMAX.S (Floating-point Maximum Single) instruction."""
+    return FPType.encode(FPFunct7.FMIN_MAX_S, rs2, rs1, 1, rd)
+
+
+def enc_fcvt_w_s(rd: int, rs1: int, rm: int = 7) -> int:
+    """Encode FCVT.W.S (Convert Float to Signed Int) instruction."""
+    return FPType.encode(FPFunct7.FCVT_W_S, 0, rs1, rm, rd)
+
+
+def enc_fcvt_wu_s(rd: int, rs1: int, rm: int = 7) -> int:
+    """Encode FCVT.WU.S (Convert Float to Unsigned Int) instruction."""
+    return FPType.encode(FPFunct7.FCVT_W_S, 1, rs1, rm, rd)
+
+
+def enc_fcvt_s_w(rd: int, rs1: int, rm: int = 7) -> int:
+    """Encode FCVT.S.W (Convert Signed Int to Float) instruction."""
+    return FPType.encode(FPFunct7.FCVT_S_W, 0, rs1, rm, rd)
+
+
+def enc_fcvt_s_wu(rd: int, rs1: int, rm: int = 7) -> int:
+    """Encode FCVT.S.WU (Convert Unsigned Int to Float) instruction."""
+    return FPType.encode(FPFunct7.FCVT_S_W, 1, rs1, rm, rd)
+
+
+def enc_fmv_x_w(rd: int, rs1: int) -> int:
+    """Encode FMV.X.W (Move Float Bits to Int Register) instruction."""
+    return FPType.encode(FPFunct7.FMV_X_W, 0, rs1, 0, rd)
+
+
+def enc_fmv_w_x(rd: int, rs1: int) -> int:
+    """Encode FMV.W.X (Move Int Bits to Float Register) instruction."""
+    return FPType.encode(FPFunct7.FMV_W_X, 0, rs1, 0, rd)
+
+
+def enc_fclass_s(rd: int, rs1: int) -> int:
+    """Encode FCLASS.S (Classify Floating-point Value) instruction."""
+    return FPType.encode(FPFunct7.FCLASS_S, 0, rs1, 1, rd)
+
+
+def enc_feq_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FEQ.S (Floating-point Equal) instruction. rd = (rs1 == rs2) ? 1 : 0."""
+    return FPType.encode(FPFunct7.FCMP_S, rs2, rs1, 2, rd)
+
+
+def enc_flt_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FLT.S (Floating-point Less Than) instruction. rd = (rs1 < rs2) ? 1 : 0."""
+    return FPType.encode(FPFunct7.FCMP_S, rs2, rs1, 1, rd)
+
+
+def enc_fle_s(rd: int, rs1: int, rs2: int) -> int:
+    """Encode FLE.S (Floating-point Less or Equal) instruction. rd = (rs1 <= rs2) ? 1 : 0."""
+    return FPType.encode(FPFunct7.FCMP_S, rs2, rs1, 0, rd)

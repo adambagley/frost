@@ -15,9 +15,14 @@
  */
 
 /*
-  CSR (Control and Status Register) File for RISC-V Zicsr + Zicntr + Machine-mode extensions.
+  CSR (Control and Status Register) File for RISC-V Zicsr + Zicntr + Machine-mode + F extensions.
 
   This module implements:
+
+  F extension CSRs (floating-point control/status):
+    - fflags (0x001): FP exception flags (NV, DZ, OF, UF, NX) - sticky, accumulated
+    - frm (0x002): FP rounding mode (RNE, RTZ, RDN, RUP, RMM)
+    - fcsr (0x003): Combined FP control/status (frm[7:5] | fflags[4:0])
 
   Zicntr base counters (read-only):
     - cycle/cycleh (0xC00/0xC80): Clock cycle counter (64-bit)
@@ -26,7 +31,7 @@
 
   Machine-mode CSRs (for trap/interrupt handling):
     - mstatus (0x300): Machine status (MIE, MPIE bits)
-    - misa (0x301): Machine ISA (read-only, reports RV32IMAB)
+    - misa (0x301): Machine ISA (read-only, reports RV32IMAFB)
     - mie (0x304): Machine interrupt enable (MEIE, MTIE, MSIE)
     - mtvec (0x305): Machine trap vector base address
     - mscratch (0x340): Machine scratch register
@@ -79,7 +84,18 @@ module csr_file #(
     output logic [XLEN-1:0] o_mepc,
 
     // Direct output of mstatus MIE bit to avoid Icarus concatenation issues
-    output logic o_mstatus_mie_direct
+    output logic o_mstatus_mie_direct,
+
+    // F extension: FP exception flags from FPU (to accumulate in fflags)
+    input riscv_pkg::fp_flags_t i_fp_flags,
+    input logic                 i_fp_flags_valid, // Valid when FP instruction retires
+
+    // F extension: FP flags from MA stage (for forwarding when CSR read is in same cycle)
+    input riscv_pkg::fp_flags_t i_fp_flags_ma,
+    input logic                 i_fp_flags_ma_valid, // Valid when FP instruction in MA stage
+
+    // F extension: Rounding mode output for FPU
+    output logic [2:0] o_frm
 );
 
   // ==========================================================================
@@ -89,6 +105,17 @@ module csr_file #(
   // 64-bit counters for Zicntr
   logic [    63:0] cycle_counter;
   logic [    63:0] instret_counter;
+
+  // F extension CSRs
+  logic [     4:0] fflags;  // FP exception flags: {NV, DZ, OF, UF, NX}
+  logic [     2:0] frm;  // FP rounding mode
+
+  // fcsr is a composite view: {24'b0, frm[2:0], fflags[4:0]}
+  logic [XLEN-1:0] fcsr;
+  assign fcsr  = {24'b0, frm, fflags};
+
+  // Output rounding mode for FPU
+  assign o_frm = frm;
 
   // Machine-mode CSRs
   // mstatus: store MIE and MPIE as separate registers to work around Icarus Verilog issues
@@ -123,10 +150,10 @@ module csr_file #(
   logic [XLEN-1:0] mip;
   assign mip = {20'b0, i_interrupts.meip, 3'b0, i_interrupts.mtip, 3'b0, i_interrupts.msip, 3'b0};
 
-  // misa is read-only: RV32IMAB
-  // Bit 0 (A), Bit 1 (B), Bit 8 (I), Bit 12 (M) = 0x0000_1103
+  // misa is read-only: RV32IMAFB
+  // Bit 0 (A), Bit 1 (B), Bit 5 (F), Bit 8 (I), Bit 12 (M) = 0x0000_1123
   // MXL = 1 (32-bit) in bits [31:30]
-  localparam logic [XLEN-1:0] MisaValue = 32'h4000_1103;
+  localparam logic [XLEN-1:0] MisaValue = 32'h4000_1123;
 
   // Output CSRs for trap unit
   assign o_mstatus = mstatus;
@@ -148,6 +175,11 @@ module csr_file #(
   always_comb begin
     csr_current_value = '0;
     unique case (i_csr_address)
+      // F extension CSRs
+      riscv_pkg::CsrFflags:   csr_current_value = {27'b0, fflags};
+      riscv_pkg::CsrFrm:      csr_current_value = {29'b0, frm};
+      riscv_pkg::CsrFcsr:     csr_current_value = fcsr;
+      // Machine-mode CSRs
       riscv_pkg::CsrMstatus:  csr_current_value = mstatus;
       riscv_pkg::CsrMie:      csr_current_value = mie;
       riscv_pkg::CsrMtvec:    csr_current_value = mtvec;
@@ -191,6 +223,42 @@ module csr_file #(
       instret_counter <= 64'd0;
     end else if (i_instruction_retired) begin
       instret_counter <= instret_counter + 64'd1;
+    end
+  end
+
+  // ==========================================================================
+  // F Extension CSR Updates (fflags, frm)
+  // ==========================================================================
+  // fflags is sticky: new exception flags are ORed with existing flags.
+  // CSR writes can clear flags explicitly.
+
+  always_ff @(posedge i_clk) begin
+    if (i_rst) begin
+      fflags <= 5'b0;
+      frm    <= 3'b0;  // Default: RNE (round to nearest, ties to even)
+    end else begin
+      // Priority: CSR write > FP flag accumulation
+      if (i_csr_write_enable && i_csr_read_enable) begin
+        unique case (i_csr_address)
+          riscv_pkg::CsrFflags: fflags <= csr_new_value[4:0];
+          riscv_pkg::CsrFrm:    frm <= csr_new_value[2:0];
+          riscv_pkg::CsrFcsr: begin
+            fflags <= csr_new_value[4:0];
+            frm    <= csr_new_value[7:5];
+          end
+          default: begin
+            // No CSR write to FP CSRs, accumulate flags if valid
+            if (i_fp_flags_valid) begin
+              fflags <= fflags | {i_fp_flags.nv, i_fp_flags.dz,
+                                  i_fp_flags.of, i_fp_flags.uf, i_fp_flags.nx};
+            end
+          end
+        endcase
+      end else if (i_fp_flags_valid) begin
+        // Accumulate FP exception flags (sticky OR)
+        fflags <= fflags | {i_fp_flags.nv, i_fp_flags.dz,
+                            i_fp_flags.of, i_fp_flags.uf, i_fp_flags.nx};
+      end
     end
   end
 
@@ -280,35 +348,79 @@ module csr_file #(
   // ==========================================================================
   // CSR Read Multiplexer
   // ==========================================================================
+  // For fflags and fcsr reads, forward pending FP flags if an FP instruction
+  // is in WB stage (i_fp_flags_valid). This handles the case where the CSR
+  // read and flag accumulation happen in the same cycle - the read should
+  // include the flags being accumulated, not just the old registered value.
+  //
+  // TIMING OPTIMIZATION: CSR read data is registered to break the timing path
+  // from instruction decode through CSR address decode to ALU result.
+  // This adds one cycle of latency to CSR reads but significantly improves timing.
+
+  // Compute forwarded fflags value (current OR pending flags from MA and/or WB)
+  // Forward from MA stage when FP instruction is in MA (handles CSR read hazard timing)
+  // Forward from WB stage when FP instruction is in WB (handles same-cycle accumulation)
+  logic [4:0] fflags_forwarded;
+  logic [4:0] ma_flags_packed;
+  logic [4:0] wb_flags_packed;
+  assign ma_flags_packed = {
+    i_fp_flags_ma.nv, i_fp_flags_ma.dz, i_fp_flags_ma.of, i_fp_flags_ma.uf, i_fp_flags_ma.nx
+  };
+  assign wb_flags_packed = {
+    i_fp_flags.nv, i_fp_flags.dz, i_fp_flags.of, i_fp_flags.uf, i_fp_flags.nx
+  };
+  assign fflags_forwarded = fflags |
+      (i_fp_flags_ma_valid ? ma_flags_packed : 5'b0) |
+      (i_fp_flags_valid ? wb_flags_packed : 5'b0);
+
+  // Combinational CSR read data (before registering)
+  logic [XLEN-1:0] csr_read_data_comb;
 
   always_comb begin
-    o_csr_read_data = '0;  // Default: return 0 for non-implemented CSRs
+    csr_read_data_comb = '0;  // Default: return 0 for non-implemented CSRs
 
     if (i_csr_read_enable) begin
       unique case (i_csr_address)
+        // F extension CSRs (with forwarding for pending flags)
+        riscv_pkg::CsrFflags: csr_read_data_comb = {27'b0, fflags_forwarded};
+        riscv_pkg::CsrFrm: csr_read_data_comb = {29'b0, frm};
+        riscv_pkg::CsrFcsr: csr_read_data_comb = {24'b0, frm, fflags_forwarded};
         // Zicntr counters (read-only)
-        riscv_pkg::CsrCycle: o_csr_read_data = cycle_counter[31:0];
-        riscv_pkg::CsrCycleH: o_csr_read_data = cycle_counter[63:32];
-        riscv_pkg::CsrTime: o_csr_read_data = i_mtime[31:0];
-        riscv_pkg::CsrTimeH: o_csr_read_data = i_mtime[63:32];
-        riscv_pkg::CsrInstret: o_csr_read_data = instret_counter[31:0];
-        riscv_pkg::CsrInstretH: o_csr_read_data = instret_counter[63:32];
+        riscv_pkg::CsrCycle: csr_read_data_comb = cycle_counter[31:0];
+        riscv_pkg::CsrCycleH: csr_read_data_comb = cycle_counter[63:32];
+        riscv_pkg::CsrTime: csr_read_data_comb = i_mtime[31:0];
+        riscv_pkg::CsrTimeH: csr_read_data_comb = i_mtime[63:32];
+        riscv_pkg::CsrInstret: csr_read_data_comb = instret_counter[31:0];
+        riscv_pkg::CsrInstretH: csr_read_data_comb = instret_counter[63:32];
         // Machine-mode CSRs
-        riscv_pkg::CsrMstatus: o_csr_read_data = mstatus;
-        riscv_pkg::CsrMisa: o_csr_read_data = MisaValue;
-        riscv_pkg::CsrMie: o_csr_read_data = mie;
-        riscv_pkg::CsrMtvec: o_csr_read_data = mtvec;
-        riscv_pkg::CsrMscratch: o_csr_read_data = mscratch;
-        riscv_pkg::CsrMepc: o_csr_read_data = mepc;
-        riscv_pkg::CsrMcause: o_csr_read_data = mcause;
-        riscv_pkg::CsrMtval: o_csr_read_data = mtval;
-        riscv_pkg::CsrMip: o_csr_read_data = mip;
+        riscv_pkg::CsrMstatus: csr_read_data_comb = mstatus;
+        riscv_pkg::CsrMisa: csr_read_data_comb = MisaValue;
+        riscv_pkg::CsrMie: csr_read_data_comb = mie;
+        riscv_pkg::CsrMtvec: csr_read_data_comb = mtvec;
+        riscv_pkg::CsrMscratch: csr_read_data_comb = mscratch;
+        riscv_pkg::CsrMepc: csr_read_data_comb = mepc;
+        riscv_pkg::CsrMcause: csr_read_data_comb = mcause;
+        riscv_pkg::CsrMtval: csr_read_data_comb = mtval;
+        riscv_pkg::CsrMip: csr_read_data_comb = mip;
         // Machine information registers (read-only)
         riscv_pkg::CsrMhartid:
-        o_csr_read_data = '0;  // Hardware thread ID (always 0 for single-core)
-        default: o_csr_read_data = '0;
+        csr_read_data_comb = '0;  // Hardware thread ID (always 0 for single-core)
+        default: csr_read_data_comb = '0;
       endcase
     end
   end
+
+  // Register CSR read data for timing optimization
+  logic [XLEN-1:0] csr_read_data_reg;
+
+  always_ff @(posedge i_clk) begin
+    if (i_rst) begin
+      csr_read_data_reg <= '0;
+    end else begin
+      csr_read_data_reg <= csr_read_data_comb;
+    end
+  end
+
+  assign o_csr_read_data = csr_read_data_reg;
 
 endmodule : csr_file

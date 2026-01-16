@@ -22,6 +22,10 @@
 
 /* UART (Universal Asynchronous Receiver/Transmitter) driver for console I/O */
 
+#ifndef UART_PRINTF_ENABLE_FLOAT
+#define UART_PRINTF_ENABLE_FLOAT 0
+#endif
+
 /* ========================================================================= */
 /* UART Transmit Functions                                                   */
 /* ========================================================================= */
@@ -39,6 +43,7 @@ void uart_puts(const char *s);
  *   %d, %ld, %lld - signed decimal
  *   %u, %lu, %llu - unsigned decimal
  *   %x, %X - hexadecimal (lowercase/uppercase)
+ *   %f - floating point (default precision 6, supports %.Nf) when enabled
  *   %% - literal percent sign
  * Supports field width (e.g., %8d) and zero-padding (e.g., %04x)
  */

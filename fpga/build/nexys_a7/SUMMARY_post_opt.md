@@ -6,7 +6,7 @@
 |--------|-------|
 | Clock Frequency | 80.000 MHz |
 | Clock Period | 12.500 ns |
-| WNS (Setup) | 2.416 ns |
+| WNS (Setup) | 2.491 ns |
 | TNS (Setup) | 0.000 ns (0 failing) |
 | WHS (Hold) | -0.107 ns |
 | THS (Hold) | -5.722 ns (73 failing) |
@@ -16,22 +16,22 @@
 
 | Metric | Value |
 |--------|-------|
-| Slack | 2.416 ns |
-| Data Path Delay | 9.901 ns |
-| Logic Delay | 3.073 ns |
-| Route Delay | 6.828 ns |
-| Logic Levels | 14 |
+| Slack | 2.491 ns |
+| Data Path Delay | 9.826 ns |
+| Logic Delay | 4.219 ns |
+| Route Delay | 5.607 ns |
+| Logic Levels | 23 |
 
 ### Path Endpoints
 
-- **Source**: `subsystem/frost_processor/cpu_and_memory_subsystem/cpu_inst/forwarding_unit_inst/register_write_data_ma_reg[2]/C`
-- **Destination**: `subsystem/frost_processor/cpu_and_memory_subsystem/cpu_inst/if_stage_inst/pc_controller_inst/o_pc_reg[29]/D`
+- **Source**: `subsystem/frost_processor/cpu_and_memory_subsystem/cpu_inst/ex_stage_inst/fpu_inst/fma_inst/prod_aligned_s5_reg[1]/C`
+- **Destination**: `subsystem/frost_processor/cpu_and_memory_subsystem/cpu_inst/ex_stage_inst/fpu_inst/fma_inst/lzc_s6_reg[0]/D`
 
 ## Resource Utilization
 
 | Resource | Used | Available | Util% |
 |----------|------|-----------|-------|
-| LUTs | 9823 | 63400 | 15.49% |
-| Registers | 6047 | 126800 | 4.77% |
+| LUTs | 15474 | 63400 | 24.41% |
+| Registers | 9569 | 126800 | 7.55% |
 | Block RAM | 21.5 | 135 | 15.93% |
-| DSPs | 4 | 240 | 1.67% |
+| DSPs | 8 | 240 | 3.33% |

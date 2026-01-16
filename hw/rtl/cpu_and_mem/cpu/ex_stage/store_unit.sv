@@ -69,6 +69,7 @@ module store_unit #(
 
     // Load instruction flags (for address mux)
     input logic i_is_load_instruction,
+    input logic i_is_fp_load,  // F extension: FLW also uses I-type immediate
     input logic i_is_load_halfword,
 
     // A-extension: AMO uses rs1 directly, SC.W checks reservation
@@ -96,8 +97,10 @@ module store_unit #(
   assign full_load_address = i_source_reg_1_value + XLEN'(signed'(i_immediate_i_type));
   // Output the appropriate address based on whether this is a load or store
   // AMO instructions use rs1 directly without any offset, word-aligned (RISC-V spec requires aligned addresses)
+  // F extension: FLW uses I-type immediate like integer loads
   assign o_data_memory_address = i_is_amo_instruction ? (i_source_reg_1_value & ~32'h3) :
-                                 i_is_load_instruction ? full_load_address : full_store_address;
+                                 (i_is_load_instruction | i_is_fp_load) ? full_load_address :
+                                                                          full_store_address;
 
   // Extract byte offset within word for sub-word stores (used for alignment)
   assign store_byte_offset = full_store_address[1:0];
@@ -126,8 +129,9 @@ module store_unit #(
   assign addr_low_load[1] = i_source_reg_1_value[1] ^ i_immediate_i_type[1] ^ carry0_load;
 
   // Select based on instruction type (AMO uses rs1 directly, always word-aligned = 2'b00)
+  // F extension: FLW uses I-type immediate like integer loads
   assign o_data_memory_address_low = i_is_amo_instruction ? 2'b00 :
-                                     i_is_load_instruction ? addr_low_load :
+                                     (i_is_load_instruction | i_is_fp_load) ? addr_low_load :
                                      addr_low_store;
 
   // A extension: SC.W success check

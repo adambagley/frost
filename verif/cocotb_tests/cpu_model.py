@@ -55,6 +55,24 @@ from encoders.op_tables import (
     FENCES,
     CSRS,
     AMO,
+    # F extension (floating-point)
+    FP_ARITH_2OP,
+    FP_ARITH_1OP,
+    FP_FMA,
+    FP_SGNJ,
+    FP_MINMAX,
+    FP_CMP,
+    FP_CVT_F2I,
+    FP_CVT_I2F,
+    FP_MV_F2I,
+    FP_MV_I2F,
+    FP_CLASS,
+    FP_LOADS,
+    FP_STORES,
+)
+from cocotb_tests.instruction_generator import (
+    FP_OPS_TO_FP_REG,
+    FP_OPS_NO_WRITE,
 )
 from models.memory_model import MemoryModel
 from models.branch_model import branch_taken_decision
@@ -91,34 +109,38 @@ class CPUModel:
         immediate_value: int,
         branch_offset: int | None,
         csr_address: int | None = None,
-    ) -> tuple[int | None, int, int]:
+        source_register_3: int = 0,
+    ) -> tuple[int | None, int, int, bool]:
         """Model execution of a single RISC-V instruction.
 
         Computes the expected behavior of executing one instruction, including:
         - Which register (if any) will be updated
         - The value to write back to that register
         - The expected program counter after execution
+        - Whether the destination is an FP register
 
         Args:
             state: Current test state with register file and PC
             memory_model: Memory model for load/store operations
-            operation: Instruction mnemonic (e.g., "add", "lw", "beq", "csrrs")
+            operation: Instruction mnemonic (e.g., "add", "lw", "beq", "csrrs", "fadd.s")
             destination_register: Destination register index (0-31)
             source_register_1: First source register index (0-31)
             source_register_2: Second source register index (0-31)
             immediate_value: Immediate value for I-type instructions
             branch_offset: Branch/jump offset (for B-type and J-type)
             csr_address: CSR address for Zicsr instructions (e.g., 0xC00 for cycle)
+            source_register_3: Third source register for FMA instructions (0-31)
 
         Returns:
-            Tuple of (register_to_update, writeback_value, expected_pc)
+            Tuple of (register_to_update, writeback_value, expected_pc, is_fp_destination)
             - register_to_update: Register index to write, or None for stores/branches
             - writeback_value: Value to write to destination register
             - expected_pc: Expected program counter after instruction
+            - is_fp_destination: True if result goes to FP register file
 
         Example:
             >>> # Model an ADD x1, x2, x3 instruction
-            >>> reg_idx, value, pc = CPUModel.model_instruction_execution(
+            >>> reg_idx, value, pc, is_fp = CPUModel.model_instruction_execution(
             ...     state, mem_model, "add", 1, 2, 3, 0, None
             ... )
             >>> reg_idx == 1  # Writes to x1
@@ -127,6 +149,11 @@ class CPUModel:
         # Set memory read address for load and AMO operations (needed before writeback calculation)
         # AMO operations use rs1 directly as address (no immediate offset)
         if operation in LOADS:
+            memory_model.read_address = (
+                state.register_file_previous[source_register_1] + immediate_value
+            ) & MASK32
+        elif operation in FP_LOADS:
+            # FP loads use integer register for address calculation
             memory_model.read_address = (
                 state.register_file_previous[source_register_1] + immediate_value
             ) & MASK32
@@ -161,11 +188,20 @@ class CPUModel:
 
         # Stores, branches, and fences don't write to destination register
         # Note: CSR instructions DO write to rd (the old CSR value)
+        # FP stores also don't write to any register
         register_index_to_update = (
             None
-            if (operation in STORES or operation in BRANCHES or operation in FENCES)
+            if (
+                operation in STORES
+                or operation in BRANCHES
+                or operation in FENCES
+                or operation in FP_OPS_NO_WRITE
+            )
             else destination_register
         )
+
+        # Determine if destination is FP or integer register
+        is_fp_destination = operation in FP_OPS_TO_FP_REG
 
         # Calculate writeback value for destination register
         writeback_value = CPUModel._compute_writeback_value(
@@ -176,6 +212,7 @@ class CPUModel:
             source_register_2,
             immediate_value,
             csr_address,
+            source_register_3,
         )
 
         # Calculate expected program counter after instruction execution
@@ -183,7 +220,12 @@ class CPUModel:
             state, operation, source_register_1, immediate_value, branch_offset
         )
 
-        return register_index_to_update, writeback_value, expected_program_counter
+        return (
+            register_index_to_update,
+            writeback_value,
+            expected_program_counter,
+            is_fp_destination,
+        )
 
     @staticmethod
     def _compute_writeback_value(
@@ -194,10 +236,11 @@ class CPUModel:
         source_register_2: int,
         immediate_value: int,
         csr_address: int | None = None,
+        source_register_3: int = 0,
     ) -> int:
         """Compute the value to write back to the destination register.
 
-        Executes the operation using software model (ALU, load, etc.) and
+        Executes the operation using software model (ALU, load, FPU, etc.) and
         returns the result that should be written to the destination register.
 
         Args:
@@ -208,6 +251,7 @@ class CPUModel:
             source_register_2: Second source register index
             immediate_value: Immediate value for I-type
             csr_address: CSR address for Zicsr instructions
+            source_register_3: Third source register for FMA instructions
 
         Returns:
             Value to write to destination register
@@ -264,6 +308,71 @@ class CPUModel:
             state.last_sc_address = sc_address
             state.last_sc_data = state.register_file_previous[source_register_2]
             return 0 if success else 1
+        # ===== F extension (floating-point) operations =====
+        elif operation in FP_LOADS:
+            # FLW: Load 32 bits from memory to FP register
+            _, fn = FP_LOADS[operation]
+            return fn(memory_model, memory_model.read_address)
+        elif operation in FP_ARITH_2OP:
+            # Two-operand FP arithmetic (fadd.s, fsub.s, fmul.s, fdiv.s)
+            _, fn = FP_ARITH_2OP[operation]
+            return fn(
+                state.fp_register_file_previous[source_register_1],
+                state.fp_register_file_previous[source_register_2],
+            )
+        elif operation in FP_ARITH_1OP:
+            # Single-operand FP arithmetic (fsqrt.s)
+            _, fn = FP_ARITH_1OP[operation]
+            return fn(state.fp_register_file_previous[source_register_1])
+        elif operation in FP_FMA:
+            # Fused multiply-add (fmadd.s, fmsub.s, fnmadd.s, fnmsub.s)
+            _, fn = FP_FMA[operation]
+            return fn(
+                state.fp_register_file_previous[source_register_1],
+                state.fp_register_file_previous[source_register_2],
+                state.fp_register_file_previous[source_register_3],
+            )
+        elif operation in FP_SGNJ:
+            # Sign injection (fsgnj.s, fsgnjn.s, fsgnjx.s)
+            _, fn = FP_SGNJ[operation]
+            return fn(
+                state.fp_register_file_previous[source_register_1],
+                state.fp_register_file_previous[source_register_2],
+            )
+        elif operation in FP_MINMAX:
+            # Min/max (fmin.s, fmax.s)
+            _, fn = FP_MINMAX[operation]
+            return fn(
+                state.fp_register_file_previous[source_register_1],
+                state.fp_register_file_previous[source_register_2],
+            )
+        elif operation in FP_CMP:
+            # Comparison (feq.s, flt.s, fle.s) -> integer result
+            _, fn = FP_CMP[operation]
+            return fn(
+                state.fp_register_file_previous[source_register_1],
+                state.fp_register_file_previous[source_register_2],
+            )
+        elif operation in FP_CVT_F2I:
+            # FP to integer conversion (fcvt.w.s, fcvt.wu.s)
+            _, fn = FP_CVT_F2I[operation]
+            return fn(state.fp_register_file_previous[source_register_1])
+        elif operation in FP_CVT_I2F:
+            # Integer to FP conversion (fcvt.s.w, fcvt.s.wu)
+            _, fn = FP_CVT_I2F[operation]
+            return fn(state.register_file_previous[source_register_1])
+        elif operation in FP_MV_F2I:
+            # FP bits to integer move (fmv.x.w)
+            _, fn = FP_MV_F2I[operation]
+            return fn(state.fp_register_file_previous[source_register_1])
+        elif operation in FP_MV_I2F:
+            # Integer bits to FP move (fmv.w.x)
+            _, fn = FP_MV_I2F[operation]
+            return fn(state.register_file_previous[source_register_1])
+        elif operation in FP_CLASS:
+            # Classify (fclass.s) -> integer result
+            _, fn = FP_CLASS[operation]
+            return fn(state.fp_register_file_previous[source_register_1])
         else:
             # Stores, branches, and fences don't produce writeback
             return 0
@@ -449,6 +558,24 @@ class CPUModel:
             state.memory_write_data_expected_queue.append(new_value)
             # Update memory model
             mem_model.write_word(write_address, new_value)
+            return
+
+        # Handle FP store (FSW)
+        if operation in FP_STORES:
+            # FSW: rs2 is FP register (data), rs1 is INT register (address)
+            write_address = (
+                state.register_file_previous[source_register_1] + immediate
+            ) & MASK32
+            # Get data from FP register file
+            write_data = state.fp_register_file_previous[source_register_2] & MASK32
+            cocotb.log.info(
+                f"op {operation} with fp_rs2_val 0x{write_data:08X} storing to address 0x{write_address:08X}"
+            )
+            # Update expected queues
+            state.memory_write_address_expected_queue.append(write_address)
+            state.memory_write_data_expected_queue.append(write_data)
+            # Update memory model (word-aligned store)
+            mem_model.write_word(write_address & MEMORY_WORD_ALIGN_MASK, write_data)
             return
 
         if operation not in STORES:

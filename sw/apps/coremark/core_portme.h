@@ -45,7 +45,7 @@ Original Author: Shay Gal-on
         Define to 1 if the platform supports floating point.
 */
 #ifndef HAS_FLOAT
-#define HAS_FLOAT 0
+#define HAS_FLOAT 1
 #endif
 /* Configuration : HAS_TIME_H
         Define to 1 if platform has the time.h header file,
@@ -112,7 +112,8 @@ typedef uint64_t CORE_TICKS;
 typedef signed short ee_s16;
 typedef unsigned short ee_u16;
 typedef signed int ee_s32;
-typedef double ee_f32;
+typedef float ee_f32;
+typedef float ee_f16;
 typedef unsigned char ee_u8;
 typedef unsigned int ee_u32;
 typedef uintptr_t ee_ptr_int;

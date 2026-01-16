@@ -15,16 +15,17 @@
  */
 
 /*
- * FROST CPU Core - 6-stage pipelined RISC-V processor (RV32IMACB)
+ * FROST CPU Core - 6-stage pipelined RISC-V processor (RV32IMACBF)
  *
  * This is the top-level CPU module containing the complete 6-stage pipeline
- * and all supporting units (forwarding, hazards, traps, CSRs, cache, atomics).
+ * and all supporting units (forwarding, hazards, traps, CSRs, cache, atomics, FPU).
  *
  * ISA Support:
  * ============
  *   RV32I   - Base integer (37 instructions)
  *   M       - Multiply/divide (8 instructions)
  *   A       - Atomics: LR/SC, AMO (11 instructions)
+ *   F       - Single-precision floating-point (26 instructions)
  *   C       - Compressed 16-bit (27 instruction forms)
  *   B       - Bit manipulation: Zba + Zbb + Zbs (43 instructions)
  *   Zicsr   - CSR access (6 instructions)
@@ -74,20 +75,29 @@
  *   ├── pd_stage          Pre-decode, early source register extraction
  *   ├── id_stage          Instruction decode, immediate extraction
  *   │   └── instr_decoder     Opcode/funct field decoding
- *   ├── ex_stage          Execute: ALU, branches, memory address
+ *   ├── ex_stage          Execute: ALU, branches, memory address, FPU
  *   │   ├── alu               Arithmetic/logic operations
  *   │   │   ├── multiplier    2-cycle pipelined multiply
  *   │   │   └── divider       16-stage pipelined divide
+ *   │   ├── fpu               Floating-point unit (F extension)
+ *   │   │   ├── fp_adder      3-cycle pipelined add/sub
+ *   │   │   ├── fp_multiplier 3-cycle pipelined multiply
+ *   │   │   ├── fp_divider    ~15-cycle sequential divide
+ *   │   │   ├── fp_sqrt       ~15-cycle sequential sqrt
+ *   │   │   ├── fp_fma        4-cycle pipelined FMA
+ *   │   │   └── ...           Compare, convert, classify, sign inject
  *   │   ├── branch_jump_unit  Branch condition evaluation
  *   │   ├── store_unit        Store address/data preparation
  *   │   └── exception_detector  ECALL, EBREAK, misaligned access
  *   ├── ma_stage          Memory access, load completion
  *   │   ├── load_unit         Load data extraction/sign-extension
  *   │   └── amo_unit          Atomic memory operations FSM
- *   ├── regfile           32x32 register file (2R/1W)
+ *   ├── regfile           32x32 integer register file (2R/1W)
+ *   ├── fp_regfile        32x32 FP register file (3R/1W for FMA)
  *   ├── l0_cache          Direct-mapped data cache (128 entries)
  *   ├── csr_file          Control/Status registers (M-mode + counters)
- *   ├── forwarding_unit   RAW hazard resolution via bypass
+ *   ├── forwarding_unit   Integer RAW hazard resolution via bypass
+ *   ├── fp_forwarding_unit FP RAW hazard resolution via bypass
  *   ├── hazard_resolution_unit  Stall/flush control
  *   ├── trap_unit         Exception/interrupt handling
  *   └── lr_sc_reservation LR/SC address reservation for atomics
@@ -119,7 +129,8 @@ module cpu #(
     */
     parameter int unsigned XLEN = riscv_pkg::XLEN,
     parameter int unsigned MEM_BYTE_ADDR_WIDTH = 16,
-    parameter int unsigned MMIO_ADDR = 32'h4000_0000
+    parameter int unsigned MMIO_ADDR = 32'h4000_0000,
+    parameter int unsigned MMIO_SIZE_BYTES = 32'h28
 ) (
     input logic i_clk,
     input logic i_rst,
@@ -132,6 +143,9 @@ module cpu #(
     output logic [XLEN-1:0] o_data_mem_wr_data,
     output logic [3:0] o_data_mem_per_byte_wr_en,
     output logic o_data_mem_read_enable,
+    output logic o_mmio_read_pulse,
+    output logic [XLEN-1:0] o_mmio_load_addr,
+    output logic o_mmio_load_valid,
     // reset sequence (due to cache LUTRAM clear) finished
     output logic o_rst_done,
     // these indicate output is valid. useful for testbench
@@ -159,6 +173,10 @@ module cpu #(
   riscv_pkg::fwd_to_ex_t fwd_to_ex;
   riscv_pkg::rf_to_fwd_t rf_to_fwd;
   riscv_pkg::pipeline_ctrl_t pipeline_ctrl;
+  // F extension: FP forwarding and regfile signals
+  riscv_pkg::fp_fwd_to_ex_t fp_fwd_to_ex;
+  riscv_pkg::fp_rf_to_fwd_t fp_rf_to_fwd;
+  logic [2:0] frm_csr;  // Rounding mode from frm CSR
   // CSR file signals (Zicsr/Zicntr extensions)
   logic [XLEN-1:0] csr_read_data;
   logic [XLEN-1:0] csr_mstatus, csr_mie, csr_mtvec, csr_mepc;
@@ -186,10 +204,16 @@ module cpu #(
   // NOTE: This is a separate wire (not through packed struct) to avoid false loop detection.
   logic stall_excluding_amo;
 
+  // Stall signal for FPU input - excludes FPU in-flight hazard so FPU can continue computing
+  // to resolve the hazard. Similar to how integer multiply continues during multiply stall.
+  logic stall_for_fpu_input;
+
   // Hazard resolution unit - manages stalls, flushes
   hazard_resolution_unit #(
       .XLEN(XLEN),
-      .NUM_PIPELINE_STAGES(NumPipelineStages)
+      .NUM_PIPELINE_STAGES(NumPipelineStages),
+      .MMIO_ADDR(MMIO_ADDR),
+      .MMIO_SIZE_BYTES(MMIO_SIZE_BYTES)
   ) hazard_resolution_unit_inst (
       .i_clk,
       .i_rst,
@@ -200,12 +224,16 @@ module cpu #(
       .i_from_cache(from_cache),
       .i_stall_for_amo(amo_stall_for_amo),
       .i_amo_write_enable_delayed(amo_write_enable_delayed),
+      // F extension: FPU stall for multi-cycle operations
+      .i_stall_for_fpu(from_ex_comb.stall_for_fpu),
       // Trap handling
       .i_trap_taken(trap_taken),
       .i_mret_taken(mret_taken),
       .i_stall_for_wfi(stall_for_wfi),
       .o_pipeline_ctrl(pipeline_ctrl),
       .o_stall_excluding_amo(stall_excluding_amo),
+      .o_stall_for_fpu_input(stall_for_fpu_input),
+      .o_mmio_read_pulse(o_mmio_read_pulse),
       .o_rst_done,
       .o_vld,
       .o_pc_vld
@@ -257,6 +285,7 @@ module cpu #(
       .i_pipeline_ctrl(pipeline_ctrl),
       .i_from_pd_to_id(from_pd_to_id),
       .i_rf_to_id(rf_to_fwd),  // Regfile read data (read in ID stage, registered here)
+      .i_fp_rf_to_id(fp_rf_to_fwd),  // F extension: FP regfile read data
       .i_from_ma_to_wb(from_ma_to_wb),  // For WB bypass (WB writes same cycle as ID reads)
       .o_from_id_to_ex(from_id_to_ex)
   );
@@ -272,7 +301,13 @@ module cpu #(
       .i_pipeline_ctrl(pipeline_ctrl),
       .i_from_id_to_ex(from_id_to_ex),
       .i_fwd_to_ex(fwd_to_ex),
+      // F extension: FP operand forwarding
+      .i_fp_fwd_to_ex(fp_fwd_to_ex),
       .i_csr_read_data(csr_read_data),
+      // F extension: Rounding mode from frm CSR
+      .i_frm_csr(frm_csr),
+      // F extension: Stall for FPU (excludes FPU RAW hazard so FPU can continue computing)
+      .i_stall_for_fpu(stall_for_fpu_input),
       .i_reservation(reservation),
       .o_from_ex_comb(from_ex_comb),
       .o_from_ex_to_ma(from_ex_to_ma)
@@ -298,13 +333,19 @@ module cpu #(
                                       {4{~pipeline_ctrl.stall_for_trap_check}});
   assign o_data_mem_read_enable = (from_ex_to_ma.is_load_instruction | from_ex_to_ma.is_lr) &
                                   ~pipeline_ctrl.stall;
+  assign o_mmio_load_addr = from_ex_to_ma.data_memory_address;
+  assign o_mmio_load_valid = from_ex_to_ma.is_load_instruction |
+                             from_ex_to_ma.is_lr |
+                             from_ex_to_ma.is_fp_load;
 
   /*
     Stage 5: Memory Access (MA)
     Completes load operations and prepares data for writeback
   */
   ma_stage #(
-      .XLEN(XLEN)
+      .XLEN(XLEN),
+      .MMIO_ADDR(MMIO_ADDR),
+      .MMIO_SIZE_BYTES(MMIO_SIZE_BYTES)
   ) ma_stage_inst (
       .i_clk,
       .i_pipeline_ctrl(pipeline_ctrl),
@@ -368,6 +409,21 @@ module cpu #(
       .o_rf_to_fwd(rf_to_fwd)
   );
 
+  /*
+    F extension: Floating-Point Register File
+    32x32 FP registers (f0-f31), with 3 read ports (for FMA) and 1 write port.
+    Unlike integer regfile, there is no hardwired zero register.
+  */
+  fp_regfile #(
+      .DATA_WIDTH(XLEN)
+  ) fp_regfile_inst (
+      .i_clk,
+      .i_pipeline_ctrl(pipeline_ctrl),
+      .i_from_pd_to_id(from_pd_to_id),  // Read addresses from PD stage
+      .i_from_ma_to_wb(from_ma_to_wb),  // Write data from WB stage
+      .o_fp_rf_to_fwd (fp_rf_to_fwd)
+  );
+
   // L0 data cache - reduces memory latency for frequently accessed data
   l0_cache #(
       .CACHE_DEPTH(128),
@@ -390,7 +446,9 @@ module cpu #(
   // Forwarding unit - resolves data hazards by forwarding results from later stages
   // Uses registered regfile data from from_id_to_ex (read in ID stage, not EX stage)
   forwarding_unit #(
-      .XLEN(XLEN)
+      .XLEN(XLEN),
+      .MMIO_ADDR(MMIO_ADDR),
+      .MMIO_SIZE_BYTES(MMIO_SIZE_BYTES)
   ) forwarding_unit_inst (
       .i_clk,
       .i_pipeline_ctrl(pipeline_ctrl),
@@ -408,15 +466,33 @@ module cpu #(
       .o_fwd_to_ex(fwd_to_ex)
   );
 
+  // F extension: FP forwarding unit - resolves FP RAW hazards
+  // Three source operand forwarding for FMA instructions (fs1, fs2, fs3)
+  fp_forwarding_unit #(
+      .XLEN(XLEN)
+  ) fp_forwarding_unit_inst (
+      .i_clk,
+      .i_pipeline_ctrl(pipeline_ctrl),
+      .i_from_pd_to_id(from_pd_to_id),
+      .i_from_id_to_ex(from_id_to_ex),
+      .i_from_ex_comb (from_ex_comb),
+      .i_from_ex_to_ma(from_ex_to_ma),
+      .i_from_ma_comb (from_ma_comb),
+      .i_from_ma_to_wb(from_ma_to_wb),
+      .o_fp_fwd_to_ex (fp_fwd_to_ex)
+  );
+
   /*
-    CSR File (Zicsr + Zicntr + Machine-mode extensions)
+    CSR File (Zicsr + Zicntr + Machine-mode + F extensions)
     Implements Control and Status Registers including:
+    - F extension: fflags, frm, fcsr (FP exception flags and rounding mode)
     - Performance counters: cycle, time, instret
     - Machine-mode CSRs: mstatus, mie, mtvec, mscratch, mepc, mcause, mtval, mip
   */
-  // CSR write enable: write when instruction commits and not stalled
+  // CSR write enable: write when instruction commits and not stalled.
+  // Ignore CSR read stall so CSR writes (e.g., MIE enable) aren't delayed an extra cycle.
   logic csr_write_enable;
-  assign csr_write_enable = ~pipeline_ctrl.stall && ~trap_taken;
+  assign csr_write_enable = ~pipeline_ctrl.stall_for_trap_check && ~trap_taken;
 
   // CSR write data: rs1 value for register-based ops, zero-extended immediate for immediate ops
   logic [XLEN-1:0] csr_write_data;
@@ -461,7 +537,16 @@ module cpu #(
       .o_mie(csr_mie),
       .o_mtvec(csr_mtvec),
       .o_mepc(csr_mepc),
-      .o_mstatus_mie_direct(csr_mstatus_mie_direct)
+      .o_mstatus_mie_direct(csr_mstatus_mie_direct),
+      // F extension: FP exception flags accumulation
+      .i_fp_flags(from_ma_to_wb.fp_flags),
+      .i_fp_flags_valid(from_ma_to_wb.fp_regfile_write_enable && o_vld && ~trap_taken),
+      // F extension: FP flags from MA stage (for CSR read hazard forwarding)
+      .i_fp_flags_ma(from_ex_to_ma.fp_flags),
+      .i_fp_flags_ma_valid(from_ex_to_ma.is_fp_instruction &&
+                           (from_ex_to_ma.fp_regfile_write_enable || from_ex_to_ma.is_fp_to_int)),
+      // F extension: Rounding mode output for FPU
+      .o_frm(frm_csr)
   );
 
   /*

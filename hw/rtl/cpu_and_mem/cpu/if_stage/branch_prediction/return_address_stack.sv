@@ -174,8 +174,18 @@ module return_address_stack #(
   // ===========================================================================
   // Provide predicted return address for returns and coroutines.
   // Valid when stack is not empty and prediction is allowed.
+  //
+  // TIMING OPTIMIZATION: Use registered detection signals (is_return_r, is_coroutine_r)
+  // instead of combinational (i_is_return, i_is_coroutine) to break the critical path:
+  //   BRAM → is_compressed → ras_detector → o_ras_valid → sel_prediction → PC
+  //
+  // This adds 1 cycle latency to RAS prediction (returns are predicted 1 cycle later),
+  // but the performance impact is acceptable:
+  //   - RAS is speculative; correctness is guaranteed by EX stage verification
+  //   - 1-cycle latency per RAS prediction is still faster than no RAS
+  //   - Breaks the WNS path allowing the design to meet timing
 
-  assign o_ras_valid = (i_is_return || i_is_coroutine) && stack_not_empty && i_prediction_allowed;
+  assign o_ras_valid = (is_return_r || is_coroutine_r) && stack_not_empty && prediction_allowed_r;
   assign o_ras_target = ras_stack[tos];
 
   // ===========================================================================

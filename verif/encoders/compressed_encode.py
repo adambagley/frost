@@ -187,6 +187,62 @@ def enc_c_sw(rs1_prime: int, rs2_prime: int, uimm: int) -> int:
     )
 
 
+def enc_c_flw(rd_prime: int, rs1_prime: int, uimm: int) -> int:
+    """Encode C.FLW: flw rd', offset(rs1').
+
+    Loads a 32-bit floating-point value from memory into FP register rd'.
+
+    Args:
+        rd_prime: Destination FP register (f8-f15, encoded as 8-15)
+        rs1_prime: Base address integer register (x8-x15)
+        uimm: Unsigned offset, must be multiple of 4, range [0, 124]
+
+    Returns:
+        16-bit encoded instruction
+    """
+    assert 8 <= rd_prime <= 15 and 8 <= rs1_prime <= 15
+    assert uimm % 4 == 0 and 0 <= uimm <= 124, "uimm must be 0-124, multiple of 4"
+
+    # uimm[5:3|2|6] encoding (same as C.LW)
+    return CompressedEncoder._pack_bits(
+        (0b011, 13, 0x7),  # funct3 for C.FLW
+        ((uimm >> 6) & 0x1, 5, 0x1),  # uimm[6] -> bit [5]
+        ((uimm >> 3) & 0x7, 10, 0x7),  # uimm[5:3] -> bits [12:10]
+        (compress_reg(rs1_prime), 7, 0x7),  # rs1' -> bits [9:7]
+        ((uimm >> 2) & 0x1, 6, 0x1),  # uimm[2] -> bit [6]
+        (compress_reg(rd_prime), 2, 0x7),  # rd' -> bits [4:2]
+        (0b00, 0, 0x3),  # opcode quadrant 0
+    )
+
+
+def enc_c_fsw(rs1_prime: int, rs2_prime: int, uimm: int) -> int:
+    """Encode C.FSW: fsw rs2', offset(rs1').
+
+    Stores a 32-bit floating-point value from FP register rs2' to memory.
+
+    Args:
+        rs1_prime: Base address integer register (x8-x15)
+        rs2_prime: Source FP register (f8-f15, encoded as 8-15)
+        uimm: Unsigned offset, must be multiple of 4, range [0, 124]
+
+    Returns:
+        16-bit encoded instruction
+    """
+    assert 8 <= rs1_prime <= 15 and 8 <= rs2_prime <= 15
+    assert uimm % 4 == 0 and 0 <= uimm <= 124
+
+    # uimm[5:3|2|6] encoding (same as C.SW)
+    return CompressedEncoder._pack_bits(
+        (0b111, 13, 0x7),  # funct3 for C.FSW
+        ((uimm >> 6) & 0x1, 5, 0x1),  # uimm[6] -> bit [5]
+        ((uimm >> 3) & 0x7, 10, 0x7),  # uimm[5:3] -> bits [12:10]
+        (compress_reg(rs1_prime), 7, 0x7),  # rs1' -> bits [9:7]
+        ((uimm >> 2) & 0x1, 6, 0x1),  # uimm[2] -> bit [6]
+        (compress_reg(rs2_prime), 2, 0x7),  # rs2' -> bits [4:2]
+        (0b00, 0, 0x3),  # opcode quadrant 0
+    )
+
+
 # =============================================================================
 # Quadrant 1 (bits [1:0] = 01)
 # =============================================================================
@@ -742,6 +798,57 @@ def enc_c_swsp(rs2: int, uimm: int) -> int:
     # uimm[5:2|7:6] encoding
     return CompressedEncoder._pack_bits(
         (0b110, 13, 0x7),  # funct3
+        ((uimm >> 2) & 0xF, 9, 0xF),  # uimm[5:2] -> bits [12:9]
+        ((uimm >> 6) & 0x3, 7, 0x3),  # uimm[7:6] -> bits [8:7]
+        (rs2, 2, 0x1F),  # rs2 -> bits [6:2]
+        (0b10, 0, 0x3),  # opcode quadrant 2
+    )
+
+
+def enc_c_flwsp(rd: int, uimm: int) -> int:
+    """Encode C.FLWSP: flw rd, offset(sp).
+
+    Load floating-point word from stack-pointer-relative address.
+
+    Args:
+        rd: Destination FP register (f0-f31)
+        uimm: Unsigned offset, must be multiple of 4, range [0, 252]
+
+    Returns:
+        16-bit encoded instruction
+    """
+    assert 0 <= rd <= 31
+    assert uimm % 4 == 0 and 0 <= uimm <= 252
+
+    # uimm[5|4:2|7:6] encoding (same as C.LWSP)
+    return CompressedEncoder._pack_bits(
+        (0b011, 13, 0x7),  # funct3 for C.FLWSP
+        ((uimm >> 5) & 0x1, 12, 0x1),  # uimm[5] -> bit [12]
+        (rd, 7, 0x1F),  # rd -> bits [11:7]
+        ((uimm >> 2) & 0x7, 4, 0x7),  # uimm[4:2] -> bits [6:4]
+        ((uimm >> 6) & 0x3, 2, 0x3),  # uimm[7:6] -> bits [3:2]
+        (0b10, 0, 0x3),  # opcode quadrant 2
+    )
+
+
+def enc_c_fswsp(rs2: int, uimm: int) -> int:
+    """Encode C.FSWSP: fsw rs2, offset(sp).
+
+    Store floating-point word to stack-pointer-relative address.
+
+    Args:
+        rs2: Source FP register (f0-f31)
+        uimm: Unsigned offset, must be multiple of 4, range [0, 252]
+
+    Returns:
+        16-bit encoded instruction
+    """
+    assert 0 <= rs2 <= 31
+    assert uimm % 4 == 0 and 0 <= uimm <= 252
+
+    # uimm[5:2|7:6] encoding (same as C.SWSP)
+    return CompressedEncoder._pack_bits(
+        (0b111, 13, 0x7),  # funct3 for C.FSWSP
         ((uimm >> 2) & 0xF, 9, 0xF),  # uimm[5:2] -> bits [12:9]
         ((uimm >> 6) & 0x3, 7, 0x3),  # uimm[7:6] -> bits [8:7]
         (rs2, 2, 0x1F),  # rs2 -> bits [6:2]

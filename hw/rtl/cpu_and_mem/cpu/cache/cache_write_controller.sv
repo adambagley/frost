@@ -106,9 +106,15 @@ module cache_write_controller #(
   assign is_memory_mapped_io_ex = i_data_memory_address_ex >= MMIO_ADDR;
 
   logic cache_write_enable_from_store;
+  // Don't gate store writes with stall here; repeated writes while stalled are
+  // idempotent, and the external memory write is already stall-gated.
   assign cache_write_enable_from_store = |i_data_memory_byte_write_enable_ex &
-                                         ~i_stall &
                                          ~is_memory_mapped_io_ex;
+
+  // Select store index independent of stall to avoid pulling stall logic into the
+  // cache write address path. Write enable still gates the actual write.
+  logic store_write_select;
+  assign store_write_select = |i_data_memory_byte_write_enable_ex & ~is_memory_mapped_io_ex;
 
   // ===========================================================================
   // Load Write Enable (Pipelined - WB Stage Timing)
@@ -174,7 +180,7 @@ module cache_write_controller #(
   assign cache_index_amo = i_amo.write_address[2+:CacheIndexWidth];
 
   assign o_cache_write_index = i_amo.write_enable ? cache_index_amo :
-                               cache_write_enable_from_store ? i_cache_index_ex :
+                               store_write_select ? i_cache_index_ex :
                                cache_index_load_registered;
 
   // ===========================================================================

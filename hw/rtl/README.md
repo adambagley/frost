@@ -2,19 +2,20 @@
 
 ## Overview
 
-FROST is a 6-stage pipelined RISC-V processor implementing **RV32IMACB** with full machine-mode privilege support for RTOS operation. The design is fully portable (no vendor-specific primitives), synthesizable with standard tools including Yosys and Vivado, and simulatable with Verilator, Icarus Verilog, and Questa.
+FROST is a 6-stage pipelined RISC-V processor implementing **RV32IMAFCB** with full machine-mode privilege support for RTOS operation. The design is fully portable (no vendor-specific primitives), synthesizable with standard tools including Yosys and Vivado, and simulatable with Verilator, Icarus Verilog, and Questa.
 
 ### Supported RISC-V Extensions
 
-**ISA: RV32IMACB** plus additional extensions
+**ISA: RV32IMAFCB** plus additional extensions
 
 | Extension        | Description                                | Instructions                                                                                                                                                       |
 |------------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **RV32I**        | Base integer instruction set               | 37 instructions                                                                                                                                                    |
 | **M**            | Integer multiply/divide                    | mul, mulh, mulhsu, mulhu, div, divu, rem, remu                                                                                                                     |
 | **A**            | Atomic memory operations                   | lr.w, sc.w, amoswap.w, amoadd.w, amoxor.w, amoand.w, amoor.w, amomin.w, amomax.w, amominu.w, amomaxu.w                                                             |
+| **F**            | Single-precision floating-point            | flw, fsw, fadd.s, fsub.s, fmul.s, fdiv.s, fsqrt.s, fmin.s, fmax.s, fmadd.s, fmsub.s, fnmadd.s, fnmsub.s, fsgnj.s, fsgnjn.s, fsgnjx.s, fcvt.w.s, fcvt.wu.s, fcvt.s.w, fcvt.s.wu, fmv.x.w, fmv.w.x, feq.s, flt.s, fle.s, fclass.s |
+| **C**            | Compressed instructions (16-bit)           | c.lwsp, c.swsp, c.lw, c.sw, c.flwsp, c.fswsp, c.flw, c.fsw, c.j, c.jal, c.jr, c.jalr, c.beqz, c.bnez, c.li, c.lui, c.addi, c.addi16sp, c.addi4spn, c.slli, c.srli, c.srai, c.andi, c.mv, c.add, c.and, c.or, c.xor, c.sub, c.nop, c.ebreak |
 | **B**            | Bit manipulation (B = Zba + Zbb + Zbs)     | See Zba, Zbb, Zbs below                                                                                                                                            |
-| **C**            | Compressed instructions (16-bit)           | c.lwsp, c.swsp, c.lw, c.sw, c.j, c.jal, c.jr, c.jalr, c.beqz, c.bnez, c.li, c.lui, c.addi, c.addi16sp, c.addi4spn, c.slli, c.srli, c.srai, c.andi, c.mv, c.add, c.and, c.or, c.xor, c.sub, c.nop, c.ebreak |
 | **Zba**          | Address generation (part of B)             | sh1add, sh2add, sh3add                                                                                                                                             |
 | **Zbb**          | Basic bit manipulation (part of B)         | andn, orn, xnor, clz, ctz, cpop, min[u], max[u], sext.b, sext.h, zext.h, rol, ror, rori, orc.b, rev8                                                               |
 | **Zbs**          | Single-bit operations (part of B)          | bset[i], bclr[i], binv[i], bext[i]                                                                                                                                 |
@@ -379,6 +380,13 @@ ID is reading in the same cycle.
 | **Branch/Jump (mispredicted)** | BTB miss/wrong prediction or RAS miss/wrong target | Flush pipeline                     | 3 cycles  |
 | **Multiply**                   | ALU                          | Stall pipeline                     | 1 cycle   |
 | **Divide**                     | ALU                          | Stall pipeline                     | 17 cycles |
+| **FP Add/Sub**                 | FPU                          | Stall pipeline                     | 4 cycles  |
+| **FP Multiply**                | FPU                          | Stall pipeline                     | 8 cycles  |
+| **FP Divide/Sqrt**             | FPU                          | Stall pipeline                     | ~32 cycles|
+| **FP FMA**                     | FPU                          | Stall pipeline                     | 12 cycles |
+| **FP Compare/Convert**         | FPU                          | Stall pipeline                     | 3 cycles  |
+| **FP Sign Inject/Classify**    | FPU                          | Stall pipeline                     | 2 cycles  |
+| **FP Load-use**                | Hazard resolution unit       | Stall until FLW completes          | 1+ cycles |
 | **Trap/Exception**             | Trap unit                    | Flush pipeline, jump to mtvec      | 2 cycles  |
 | **MRET**                       | Trap unit                    | Flush pipeline, jump to mepc       | 2 cycles  |
 | **WFI**                        | Trap unit                    | Stall until interrupt              | Variable  |
@@ -686,10 +694,22 @@ rtl/
         │   ├── branch_redirect_unit.sv  # Misprediction detection, BTB/RAS recovery
         │   ├── store_unit.sv         # Store address/data preparation
         │   ├── exception_detector.sv # ECALL, EBREAK, misaligned access detection
-        │   └── alu/
-        │       ├── alu.sv            # Main ALU (all extensions)
-        │       ├── multiplier.sv     # 1-cycle registered multiplier
-        │       └── divider.sv        # 17-cycle radix-2 divider (2x folded)
+        │   ├── alu/
+        │   │   ├── alu.sv            # Main ALU (all extensions)
+        │   │   ├── multiplier.sv     # 1-cycle registered multiplier
+        │   │   └── divider.sv        # 17-cycle radix-2 divider (2x folded)
+        │   └── fpu/                  # Floating-Point Unit (F extension)
+        │       ├── fpu.sv            # FPU top-level, operation routing
+        │       ├── fp_adder.sv       # Addition/subtraction (4-cycle)
+        │       ├── fp_multiplier.sv  # Multiplication (8-cycle)
+        │       ├── fp_divider.sv     # Division (~32-cycle)
+        │       ├── fp_sqrt.sv        # Square root (~32-cycle)
+        │       ├── fp_fma.sv         # Fused multiply-add (12-cycle)
+        │       ├── fp_compare.sv     # Comparisons and min/max (3-cycle)
+        │       ├── fp_convert.sv     # Integer/FP conversions (3-cycle)
+        │       ├── fp_classify.sv    # FCLASS.S (1-cycle)
+        │       ├── fp_sign_inject.sv # Sign injection (1-cycle)
+        │       └── fp_round.sv       # Rounding logic (shared)
         │
         ├── ma_stage/                 # Memory Access stage
         │   ├── ma_stage.sv           # Load completion, AMO coordination
@@ -697,7 +717,8 @@ rtl/
         │   └── amo_unit.sv           # Atomic memory operation state machine
         │
         ├── wb_stage/                 # Writeback stage
-        │   └── regfile.sv            # 32x32 register file (2R/1W)
+        │   ├── regfile.sv            # 32x32 integer register file (2R/1W)
+        │   └── fp_regfile.sv         # 32x32 floating-point register file (3R/1W)
         │
         ├── cache/                    # Cache subsystem
         │   ├── l0_cache.sv           # Direct-mapped L0 data cache
@@ -708,8 +729,9 @@ rtl/
         │   └── csr_file.sv           # CSR register file (M-mode + counters)
         │
         └── control/                  # Pipeline control
-            ├── forwarding_unit.sv    # Data hazard forwarding
-            ├── hazard_resolution_unit.sv # Stall/flush control
+            ├── forwarding_unit.sv    # Integer data hazard forwarding
+            ├── fp_forwarding_unit.sv # FP data hazard forwarding (F extension)
+            ├── hazard_resolution_unit.sv # Stall/flush control (incl. FPU stalls)
             ├── trap_unit.sv          # Interrupt/exception handling
             └── lr_sc_reservation.sv  # A extension: LR/SC address reservation
 ```
@@ -842,6 +864,152 @@ Cycle N+1: Result registered and available (MULH/MULHSU/MULHU select upper 32 bi
 **Special case handling per RISC-V spec:**
 - Divide by zero: quotient = -1 (all 1s), remainder = dividend
 - Signed overflow (MIN_INT / -1): quotient = MIN_INT, remainder = 0
+
+### Floating-Point Unit (`fpu.sv`)
+
+The FPU implements the complete RISC-V F extension (single-precision floating-point) with
+IEEE 754-compliant operations. The current implementation uses **non-pipelined multi-cycle
+execution** — each FP operation stalls the pipeline until completion.
+
+#### FPU Architecture
+
+```
+                              FPU Top-Level (fpu.sv)
+  +---------------------------------------------------------------------------------+
+  |                                                                                 |
+  |   from EX stage (operands, operation) ------------------------------------------|
+  |                |                                                                |
+  |                v                                                                |
+  |   +------------------------------------------------------------------------+    |
+  |   |                        Operation Routing                               |    |
+  |   |  Decode i_operation, resolve dynamic rounding mode (frm CSR)           |    |
+  |   +---+--------+--------+--------+--------+--------+--------+--------+-----+    |
+  |       |        |        |        |        |        |        |        |          |
+  |       v        v        v        v        v        v        v        v          |
+  |   +------+ +------+ +------+ +------+ +------+ +------+ +------+ +------+       |
+  |   |Adder | | Mult | | Div  | | Sqrt | | FMA  | | Cmp  | | Conv | | Sign |       |
+  |   |      | |      | |      | |      | |      | |      | |      | | Inj  |       |
+  |   |4-cyc | |8-cyc | |~32cy | |~32cy | |12-cyc| |3-cyc | |3-cyc | |2-cyc |       |
+  |   +--+---+ +--+---+ +--+---+ +--+---+ +--+---+ +--+---+ +--+---+ +--+---+       |
+  |      |        |        |        |        |        |        |        |           |
+  |      +--------+--------+--------+--------+--------+--------+--------+           |
+  |                                    |                                            |
+  |                                    v                                            |
+  |   +------------------------------------------------------------------------+    |
+  |   |                        Result Multiplexing                             |    |
+  |   |  Select result from completing unit, aggregate exception flags         |    |
+  |   +----------------------------+-------------------------------------------+    |
+  |                                |                                                |
+  |   o_result, o_valid, o_flags --+----------------------------------------------->|
+  |   o_stall (back to hazard unit) ----------------------------------------------->|
+  |   o_inflight_dest_* (for RAW hazard detection) -------------------------------->|
+  |                                                                                 |
+  +---------------------------------------------------------------------------------+
+```
+
+#### FPU Integration with Pipeline
+
+```
+                          EX Stage with FPU
+  +---------------------------------------------------------------------------------+
+  |                                                                                 |
+  |   from ID -----+----------------------------------------------------------------|
+  |                |                                                                |
+  |                v                                                                |
+  |   +-------------------------+     +------------------------------------------+  |
+  |   |          ALU            |     |                 FPU                      |  |
+  |   |  (integer operations)   |     |  (floating-point operations)             |  |
+  |   |                         |     |                                          |  |
+  |   |  RV32I, M, Zba, Zbb,    |     |  FADD, FSUB, FMUL, FDIV, FSQRT           |  |
+  |   |  Zbs, Zicond, Zbkb      |     |  FMADD, FMSUB, FNMADD, FNMSUB            |  |
+  |   |                         |     |  FMIN, FMAX, FEQ, FLT, FLE               |  |
+  |   |  Multiplier (1-cycle)   |     |  FCVT.*, FMV.*, FSGNJ*, FCLASS           |  |
+  |   |  Divider (17-cycle)     |     |                                          |  |
+  |   +------------+------------+     +---------------------+--------------------+  |
+  |                |                                        |                       |
+  |                |    alu_result                          | fpu_result            |
+  |                v                                        v                       |
+  |   +------------------------------------------------------------------------+    |
+  |   |                        EX Result Mux                                   |    |
+  |   |  Integer ops: ALU result    FP ops: FPU result                         |    |
+  |   |  FP->Int (FEQ/FLT/FLE/FCVT.W/FCLASS/FMV.X.W): FPU result to int rd     |    |
+  |   +----------------------------+-------------------------------------------+    |
+  |                                |                                                |
+  |                                v                                                |
+  |   +------------------------------------------------------------------------+    |
+  |   |                    Register File Selection                             |    |
+  |   |  o_result_to_int? → Integer regfile    else → FP regfile               |    |
+  |   +------------------------------------------------------------------------+    |
+  |                                                                                 |
+  |   Stall signals: alu_stall (div) ∨ fpu_stall → hazard_resolution_unit           |
+  |                                                                                 |
+  +---------------------------------------------------------------------------------+
+```
+
+#### Current Implementation Status
+
+The FPU is currently **non-pipelined**: each operation captures its operands at the start
+and stalls the pipeline until the result is ready. This design was chosen to:
+
+1. **Simplify timing**: No complex operand capture/bypass logic needed
+2. **Reduce area**: Single execution unit per operation type (no pipeline stages)
+3. **Maintain correctness**: Easier to verify without hazard interactions
+
+**Trade-off**: Lower throughput for FP-heavy code. Back-to-back FP operations incur full
+stall penalties. This is acceptable for workloads where FP operations are infrequent
+(e.g., sensor processing, configuration parsing) but limits performance for compute-
+intensive FP workloads (e.g., DSP, graphics).
+
+#### Operation Latencies
+
+| Operation Category | Instructions | Latency | Notes |
+|--------------------|--------------|---------|-------|
+| **Sign Injection** | FSGNJ.S, FSGNJN.S, FSGNJX.S | 2 cycles | Combinational + output register |
+| **Classification** | FCLASS.S | 2 cycles | Combinational + output register |
+| **Comparison** | FEQ.S, FLT.S, FLE.S, FMIN.S, FMAX.S | 3 cycles | Multi-cycle with special case handling |
+| **Conversion** | FCVT.W.S, FCVT.WU.S, FCVT.S.W, FCVT.S.WU, FMV.X.W, FMV.W.X | 3 cycles | Includes rounding logic |
+| **Addition** | FADD.S, FSUB.S | 4 cycles | Alignment, add, normalize, round |
+| **Multiplication** | FMUL.S | 8 cycles | 24×24 mantissa multiply, normalize, round |
+| **Fused Multiply-Add** | FMADD.S, FMSUB.S, FNMADD.S, FNMSUB.S | 12 cycles | Single rounding (not mul + add) |
+| **Division** | FDIV.S | ~32 cycles | Goldschmidt iteration |
+| **Square Root** | FSQRT.S | ~32 cycles | Newton-Raphson iteration |
+
+#### Hazard Handling
+
+**FP RAW Hazards**: The FPU exposes in-flight destination registers (`o_inflight_dest_*`)
+to the hazard resolution unit. Instructions that read an in-flight FP destination stall
+until the producing operation completes.
+
+**FP Load-Use Hazards**: FLW (FP load) followed by an FP instruction using that register
+triggers a load-use stall, similar to integer loads.
+
+**FP Forwarding**: The `fp_forwarding_unit` forwards results from MA and WB stages to
+EX, avoiding stalls when the producing instruction has completed but not yet written back.
+
+#### IEEE 754 Compliance
+
+- **Special values**: ±0, ±∞, NaN handled per IEEE 754-2008
+- **Canonical NaN**: All NaN results produce the canonical quiet NaN (0x7FC00000)
+- **Rounding modes**: All five modes supported (RNE, RTZ, RDN, RUP, RMM)
+- **Exception flags**: NV, DZ, OF, UF, NX accumulated in `fflags` CSR
+- **Subnormal support**: Full subnormal handling (no flush-to-zero)
+
+#### Future Enhancement: Pipelined FPU
+
+A future enhancement could pipeline the FPU for higher throughput:
+
+```
+Pipelined Design (not implemented):
+  - 4-stage adder pipeline (1 add/cycle throughput after fill)
+  - 8-stage multiplier pipeline
+  - Out-of-order completion with scoreboarding
+  - Hazard detection via in-flight register tracking
+
+Current Design:
+  - Non-pipelined, stalls until each operation completes
+  - Simpler verification, lower area
+  - Suitable for low-FP-intensity workloads
+```
 
 ### Branch Predictor (`branch_predictor.sv`)
 
@@ -1085,8 +1253,8 @@ FROST implements full machine-mode privilege support, enabling both bare-metal a
 
 | CSR         | Address | Access | Description                                   |
 |-------------|---------|--------|-----------------------------------------------|
-| `mstatus`   | 0x300   | R/W    | Machine status (MIE, MPIE, MPP fields)        |
-| `misa`      | 0x301   | RO     | ISA description (RV32IMACB)                   |
+| `mstatus`   | 0x300   | R/W    | Machine status (MIE, MPIE, MPP, FS fields)    |
+| `misa`      | 0x301   | RO     | ISA description (RV32IMAFCB)                  |
 | `mie`       | 0x304   | R/W    | Interrupt enable (MEIE, MTIE, MSIE bits)      |
 | `mtvec`     | 0x305   | R/W    | Trap vector base address (direct mode only)   |
 | `mscratch`  | 0x340   | R/W    | Scratch register for trap handlers            |
@@ -1098,6 +1266,28 @@ FROST implements full machine-mode privilege support, enabling both bare-metal a
 | `marchid`   | 0xF12   | RO     | Architecture ID (0)                           |
 | `mimpid`    | 0xF13   | RO     | Implementation ID (0)                         |
 | `mhartid`   | 0xF14   | RO     | Hardware thread ID (0)                        |
+
+### Floating-Point CSRs (F Extension)
+
+| CSR      | Address | Access | Description                                      |
+|----------|---------|--------|--------------------------------------------------|
+| `fflags` | 0x001   | R/W    | FP exception flags (NV, DZ, OF, UF, NX)          |
+| `frm`    | 0x002   | R/W    | FP rounding mode (RNE, RTZ, RDN, RUP, RMM)       |
+| `fcsr`   | 0x003   | R/W    | FP control/status (frm[7:5] + fflags[4:0])       |
+
+**Rounding modes (frm):**
+- `000` (RNE): Round to Nearest, ties to Even
+- `001` (RTZ): Round towards Zero
+- `010` (RDN): Round Down (towards −∞)
+- `011` (RUP): Round Up (towards +∞)
+- `100` (RMM): Round to Nearest, ties to Max Magnitude
+
+**Exception flags (fflags):**
+- Bit 4 (NV): Invalid operation
+- Bit 3 (DZ): Divide by zero
+- Bit 2 (OF): Overflow
+- Bit 1 (UF): Underflow
+- Bit 0 (NX): Inexact
 
 ### Supported Exceptions
 

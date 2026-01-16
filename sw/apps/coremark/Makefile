@@ -6,6 +6,7 @@ INCLUDE_DIR = ./coremark
 ITERATIONS ?= 11000
 
 # Add ITERATIONS to CFLAGS before including common.mk
-EXTRA_CFLAGS = '-DITERATIONS=$(ITERATIONS)'
+EXTRA_CFLAGS = '-DITERATIONS=$(ITERATIONS)' -DUART_PRINTF_ENABLE_FLOAT=1
+EXTRA_LDFLAGS = -lgcc
 
 include ../../common/common.mk

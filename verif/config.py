@@ -183,12 +183,27 @@ class DUTSignalPaths:
     regfile_ram_rs1_path: str = (
         "device_under_test.regfile_inst.source_register_1_ram.ram"
     )
-    """Path to register file RAM for rs1 read port."""
+    """Path to integer register file RAM for rs1 read port."""
 
     regfile_ram_rs2_path: str = (
         "device_under_test.regfile_inst.source_register_2_ram.ram"
     )
-    """Path to register file RAM for rs2 read port."""
+    """Path to integer register file RAM for rs2 read port."""
+
+    fp_regfile_ram_fs1_path: str = (
+        "device_under_test.fp_regfile_inst.fp_source_reg_1_ram.ram"
+    )
+    """Path to FP register file RAM for fs1 read port."""
+
+    fp_regfile_ram_fs2_path: str = (
+        "device_under_test.fp_regfile_inst.fp_source_reg_2_ram.ram"
+    )
+    """Path to FP register file RAM for fs2 read port."""
+
+    fp_regfile_ram_fs3_path: str = (
+        "device_under_test.fp_regfile_inst.fp_source_reg_3_ram.ram"
+    )
+    """Path to FP register file RAM for fs3 read port (for FMA instructions)."""
 
     data_memory_path: str = "data_memory_for_simulation.memory"
     """Path to data memory array in testbench."""

@@ -166,19 +166,21 @@ class InstructionExecutor:
             raise ValueError(f"Unknown ALU operation: {operation}")
 
         # Model expected behavior
-        rd_to_update, rd_wb_value, expected_pc = CPUModel.model_instruction_execution(
-            self.state, self.mem_model, operation, rd, rs1, rs2, imm, None, None
+        rd_to_update, rd_wb_value, expected_pc, is_fp_dest = (
+            CPUModel.model_instruction_execution(
+                self.state, self.mem_model, operation, rd, rs1, rs2, imm, None, None
+            )
         )
 
         # Update register file model
-        if rd_to_update:
-            self.state.register_file_current[rd_to_update] = rd_wb_value & MASK32
+        if rd_to_update is not None:
+            if is_fp_dest:
+                self.state.update_fp_register(rd_to_update, rd_wb_value)
+            else:
+                self.state.update_register(rd_to_update, rd_wb_value)
 
         # Queue expected outputs
-        self.state.register_file_current_expected_queue.append(
-            self.state.register_file_current.copy()
-        )
-        self.state.program_counter_expected_values_queue.append(expected_pc)
+        self.state.queue_expected_outputs(expected_pc)
 
         if log:
             cocotb.log.info(
@@ -232,19 +234,21 @@ class InstructionExecutor:
         self.mem_model.read_address = address
 
         # Model expected behavior
-        rd_to_update, rd_wb_value, expected_pc = CPUModel.model_instruction_execution(
-            self.state, self.mem_model, operation, rd, rs1, 0, imm, None, None
+        rd_to_update, rd_wb_value, expected_pc, is_fp_dest = (
+            CPUModel.model_instruction_execution(
+                self.state, self.mem_model, operation, rd, rs1, 0, imm, None, None
+            )
         )
 
         # Update register file model
-        if rd_to_update:
-            self.state.register_file_current[rd_to_update] = rd_wb_value & MASK32
+        if rd_to_update is not None:
+            if is_fp_dest:
+                self.state.update_fp_register(rd_to_update, rd_wb_value)
+            else:
+                self.state.update_register(rd_to_update, rd_wb_value)
 
         # Queue expected outputs
-        self.state.register_file_current_expected_queue.append(
-            self.state.register_file_current.copy()
-        )
-        self.state.program_counter_expected_values_queue.append(expected_pc)
+        self.state.queue_expected_outputs(expected_pc)
 
         if log:
             cocotb.log.info(
@@ -297,15 +301,12 @@ class InstructionExecutor:
         )
 
         # Model expected behavior (stores don't write to register file)
-        _, _, expected_pc = CPUModel.model_instruction_execution(
+        _, _, expected_pc, _ = CPUModel.model_instruction_execution(
             self.state, self.mem_model, operation, 0, rs1, rs2, imm, None, None
         )
 
         # Queue expected outputs (no register change for store)
-        self.state.register_file_current_expected_queue.append(
-            self.state.register_file_current.copy()
-        )
-        self.state.program_counter_expected_values_queue.append(expected_pc)
+        self.state.queue_expected_outputs(expected_pc)
 
         if log:
             address = (self.state.register_file_previous[rs1] + imm) & MASK32
@@ -369,11 +370,8 @@ class InstructionExecutor:
             self.state.register_file_current[rd] = loaded_value & MASK32
 
         # Queue expected outputs
-        self.state.register_file_current_expected_queue.append(
-            self.state.register_file_current.copy()
-        )
         expected_pc = (self.state.program_counter_current + 4) & MASK32
-        self.state.program_counter_expected_values_queue.append(expected_pc)
+        self.state.queue_expected_outputs(expected_pc)
 
         if log:
             cocotb.log.info(
@@ -444,11 +442,8 @@ class InstructionExecutor:
             self.state.register_file_current[rd] = result_value & MASK32
 
         # Queue expected outputs
-        self.state.register_file_current_expected_queue.append(
-            self.state.register_file_current.copy()
-        )
         expected_pc = (self.state.program_counter_current + 4) & MASK32
-        self.state.program_counter_expected_values_queue.append(expected_pc)
+        self.state.queue_expected_outputs(expected_pc)
 
         if log:
             status = "SUCCESS" if success else "FAILED"

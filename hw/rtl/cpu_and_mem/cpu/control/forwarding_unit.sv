@@ -69,7 +69,9 @@
  *   - l0_cache.sv: Provides cache hit data for 0-cycle forwarding
  */
 module forwarding_unit #(
-    parameter int unsigned XLEN = 32
+    parameter int unsigned XLEN = 32,
+    parameter int unsigned MMIO_ADDR = 32'h4000_0000,
+    parameter int unsigned MMIO_SIZE_BYTES = 32'h28
 ) (
     input logic i_clk,
     // control inputs
@@ -111,22 +113,51 @@ module forwarding_unit #(
   // Data to forward from Memory Access stage (registered)
   logic [XLEN-1:0] register_write_data_ma;
 
+  // MMIO load detection (used to refresh forward data during MMIO stalls).
+  logic mmio_load_in_ma;
+  assign mmio_load_in_ma =
+      (i_from_ex_to_ma.is_load_instruction | i_from_ex_to_ma.is_lr) &&
+      (i_from_ex_to_ma.data_memory_address >= MMIO_ADDR) &&
+      (i_from_ex_to_ma.data_memory_address < (MMIO_ADDR + MMIO_SIZE_BYTES));
+
   // Detect when forwarding is needed (RAW hazard detection)
   // TIMING OPTIMIZATION: Use early source registers from PD stage for better timing.
   // These are extracted in parallel with decompression and bypass the full instruction mux path.
+  // Treat FP-to-int ops (FMV.X.W, FCVT.W.S, compares) as integer register writers
+  // so back-to-back consumers get forwarded data.
+  logic ex_writes_int_reg;
+  assign ex_writes_int_reg =
+      i_from_ex_comb.regfile_write_enable |
+      i_from_id_to_ex.is_load_instruction |
+      i_from_id_to_ex.is_amo_instruction |
+      i_from_id_to_ex.is_fp_to_int;
+
+  // Int -> FP capture bypass: when a load-use hazard is detected and the
+  // current EX instruction is int->fp, feed MA load data directly so the
+  // FPU captures the correct operand at the stall edge.
+  logic int_capture_bypass_valid;
+  logic [XLEN-1:0] int_capture_bypass_data;
+  assign int_capture_bypass_valid =
+      i_pipeline_ctrl.load_use_hazard_detected &&
+      i_from_ex_to_ma.is_load_instruction &&
+      i_from_id_to_ex.is_int_to_fp &&
+      (i_from_ex_to_ma.instruction.dest_reg != 0) &&
+      (i_from_ex_to_ma.instruction.dest_reg ==
+       i_from_id_to_ex.instruction.source_reg_1);
+
+  assign int_capture_bypass_data = i_from_ma_comb.data_loaded_from_memory;
+
   always_ff @(posedge i_clk) begin
     if (~i_pipeline_ctrl.stall) begin
       // Forward from MA stage if instruction in EX writes to register needed in ID
       // Note: AMO instructions also write to rd (the old memory value), so include them
       forward_source_reg_1_from_ma <=
-          (i_from_ex_comb.regfile_write_enable | i_from_id_to_ex.is_load_instruction |
-           i_from_id_to_ex.is_amo_instruction) &&
+          ex_writes_int_reg &&
           i_from_id_to_ex.instruction.dest_reg != 0 &&
           i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.source_reg_1_early;
 
       forward_source_reg_2_from_ma <=
-          (i_from_ex_comb.regfile_write_enable | i_from_id_to_ex.is_load_instruction |
-           i_from_id_to_ex.is_amo_instruction) &&
+          ex_writes_int_reg &&
           i_from_id_to_ex.instruction.dest_reg != 0 &&
           i_from_id_to_ex.instruction.dest_reg == i_from_pd_to_id.source_reg_2_early;
 
@@ -150,33 +181,39 @@ module forwarding_unit #(
   end
 
   // Select data to forward from MA stage
-  // Special handling for load-use hazards, AMO-use hazards, and cache hits
+  // Special handling for load-use hazards and AMO-use hazards
   always_ff @(posedge i_clk)
-    if (i_pipeline_ctrl.stall_for_load_use_hazard)
-      // Load/AMO-use hazard: stall_for_load_use_hazard is set for both load and AMO
-      // Use raw memory data for AMO (during amo_read_phase), processed data for load
+    if (i_pipeline_ctrl.stall_for_load_use_hazard || (i_pipeline_ctrl.stall && mmio_load_in_ma))
+      // Load/AMO-use hazard or MMIO-load stall: use memory data
+      // (refresh during MMIO stall so forwarding sees the updated read data).
       if (i_amo_read_phase)
         register_write_data_ma <= i_from_ma_comb.data_memory_read_data;
       else register_write_data_ma <= i_from_ma_comb.data_loaded_from_memory;
     else if (~i_pipeline_ctrl.stall)
-      // Normal case: use cache hit data if available, otherwise ALU result
-      // TIMING OPTIMIZATION: Removed redundant is_load_instruction check.
-      // cache_hit_on_load already incorporates is_load_instruction in l0_cache.sv
-      // (via cache_access_eligible), so this AND gate was adding unnecessary delay.
-      register_write_data_ma <= i_from_cache.cache_hit_on_load ?
-                                i_from_cache.data_loaded_from_cache :
+      // Normal case: use ALU result (cache-hit forwarding uses registered path below)
+      register_write_data_ma <= i_from_id_to_ex.is_fp_to_int ?
+                                i_from_ex_comb.fp_result :
                                 i_from_ex_comb.alu_result;
+
+  // Use registered cache hit/data for load forwarding (breaks EX->cache->forwarding path)
+  logic [XLEN-1:0] forward_data_ma;
+  assign forward_data_ma = i_from_cache.cache_hit_on_load_reg ?
+                           i_from_cache.data_loaded_from_cache_reg :
+                           register_write_data_ma;
 
   // Final multiplexing: select forwarded value or register file value
   // Priority order: MA stage forward > WB stage forward > Register file
   assign o_fwd_to_ex.source_reg_1_value =
-      forward_source_reg_1_from_ma ? register_write_data_ma :
+      forward_source_reg_1_from_ma ? forward_data_ma :
       forward_source_reg_1_from_wb ? i_from_ma_to_wb.regfile_write_data :
       source_reg_1_raw_value;
 
   assign o_fwd_to_ex.source_reg_2_value =
-      forward_source_reg_2_from_ma ? register_write_data_ma :
+      forward_source_reg_2_from_ma ? forward_data_ma :
       forward_source_reg_2_from_wb ? i_from_ma_to_wb.regfile_write_data :
       source_reg_2_raw_value;
+
+  assign o_fwd_to_ex.capture_bypass_int_valid = int_capture_bypass_valid;
+  assign o_fwd_to_ex.capture_bypass_int_data = int_capture_bypass_data;
 
 endmodule : forwarding_unit

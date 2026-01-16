@@ -79,6 +79,7 @@ module cpu_and_mem #(
   // - sw/common/link.ld (MMIO memory region and PROVIDE statements)
   // - cpu module parameters
   localparam int unsigned MmioAddr = 32'h4000_0000;
+  localparam int unsigned MmioSizeBytes = 32'h28;
   localparam int unsigned UartMmioAddr = 32'h4000_0000;  // UART TX (write-only)
   localparam int unsigned UartRxDataMmioAddr = 32'h4000_0004;  // UART RX data (read consumes byte)
   localparam int unsigned UartRxStatusMmioAddr = 32'h4000_0024; // RX status (bit0 = data available)
@@ -100,10 +101,16 @@ module cpu_and_mem #(
   logic [31:0] program_counter, instruction;
   logic [31:0] data_memory_address, data_memory_write_data, data_memory_write_data_registered;
   logic                  [31:0] data_memory_or_peripheral_read_data;  // Muxed from RAM or MMIO
+  logic                  [31:0] mmio_read_data_comb;
+  logic                  [31:0] mmio_read_data_reg;
+  logic                         is_mmio_registered;
+  logic                  [31:0] mmio_load_addr;
+  logic                         mmio_load_valid;
   logic                  [31:0] data_memory_read_data;  // From RAM only
   logic                  [31:0] data_memory_address_registered;  // Delayed for read data alignment
   logic                  [ 3:0] data_memory_byte_write_enable;
   logic                         data_memory_read_enable;
+  logic                         mmio_read_pulse;
 
   // Timer registers (CLINT-style)
   logic                  [63:0] mtime;  // Machine time counter
@@ -112,7 +119,9 @@ module cpu_and_mem #(
 
   // Interrupt signals to CPU
   riscv_pkg::interrupt_t        interrupts;
-  assign interrupts.meip = i_external_interrupt;
+  // Clamp unknown external interrupt values to 0 for simulation stability.
+  // This avoids X-propagation into mip when the top-level input is left un-driven.
+  assign interrupts.meip = (i_external_interrupt === 1'b1);
   assign interrupts.msip = msip;
 
   // Timer interrupt: register the 64-bit comparison result to break critical timing path.
@@ -130,7 +139,8 @@ module cpu_and_mem #(
   // Note: B = Zba + Zbb + Zbs (full bit manipulation extension)
   cpu #(
       .MEM_BYTE_ADDR_WIDTH(MemByteAddrWidth),
-      .MMIO_ADDR(MmioAddr)
+      .MMIO_ADDR(MmioAddr),
+      .MMIO_SIZE_BYTES(MmioSizeBytes)
   ) cpu_inst (
       .i_clk,
       .i_rst,
@@ -140,6 +150,9 @@ module cpu_and_mem #(
       .o_data_mem_wr_data(data_memory_write_data),
       .o_data_mem_per_byte_wr_en(data_memory_byte_write_enable),
       .o_data_mem_read_enable(data_memory_read_enable),
+      .o_mmio_read_pulse(mmio_read_pulse),
+      .o_mmio_load_addr(mmio_load_addr),
+      .o_mmio_load_valid(mmio_load_valid),
       .i_data_mem_rd_data(data_memory_or_peripheral_read_data),
       .o_rst_done(/*not connected*/),
       .o_vld   (/*not connected*/),
@@ -152,7 +165,8 @@ module cpu_and_mem #(
   );
 
   logic is_mmio;
-  assign is_mmio = data_memory_address >= MmioAddr;
+  assign is_mmio = (data_memory_address >= MmioAddr) &&
+                   (data_memory_address < (MmioAddr + MmioSizeBytes));
 
   // Dual-port RAM for instruction and data memory (unified memory architecture)
   // Port A: Instruction fetch (or external write for programming)
@@ -187,24 +201,40 @@ module cpu_and_mem #(
     data_memory_write_data_registered <= data_memory_write_data;
   end
 
-  // Multiplexer for read data - selects between memory and memory-mapped peripherals
+  assign is_mmio_registered = mmio_load_valid &&
+                              (mmio_load_addr >= MmioAddr) &&
+                              (mmio_load_addr < (MmioAddr + MmioSizeBytes));
+
+  // MMIO read data selection (combinational, captured on mmio_read_pulse)
   always_comb begin
-    data_memory_or_peripheral_read_data = data_memory_read_data;  // Default: use RAM data
-    // Check registered address (delayed to match RAM read latency)
-    unique case (data_memory_address_registered)
+    mmio_read_data_comb = '0;
+    // Use MA-stage address captured from CPU for MMIO reads
+    unique case (mmio_load_addr)
       // UART RX data - returns received byte in lower 8 bits (reading consumes byte)
-      UartRxDataMmioAddr:   data_memory_or_peripheral_read_data = {24'b0, i_uart_rx_data};
+      UartRxDataMmioAddr:   mmio_read_data_comb = {24'b0, i_uart_rx_data};
       // UART RX status - bit 0 indicates data available (non-destructive read)
-      UartRxStatusMmioAddr: data_memory_or_peripheral_read_data = {31'b0, i_uart_rx_valid};
-      Fifo0MmioAddr:        data_memory_or_peripheral_read_data = i_fifo0_rd_data;
-      Fifo1MmioAddr:        data_memory_or_peripheral_read_data = i_fifo1_rd_data;
-      MtimeLowMmioAddr:     data_memory_or_peripheral_read_data = mtime[31:0];
-      MtimeHighMmioAddr:    data_memory_or_peripheral_read_data = mtime[63:32];
-      MtimecmpLowMmioAddr:  data_memory_or_peripheral_read_data = mtimecmp[31:0];
-      MtimecmpHighMmioAddr: data_memory_or_peripheral_read_data = mtimecmp[63:32];
-      MsipMmioAddr:         data_memory_or_peripheral_read_data = {31'b0, msip};
+      UartRxStatusMmioAddr: mmio_read_data_comb = {31'b0, i_uart_rx_valid};
+      Fifo0MmioAddr:        mmio_read_data_comb = i_fifo0_rd_data;
+      Fifo1MmioAddr:        mmio_read_data_comb = i_fifo1_rd_data;
+      MtimeLowMmioAddr:     mmio_read_data_comb = mtime[31:0];
+      MtimeHighMmioAddr:    mmio_read_data_comb = mtime[63:32];
+      MtimecmpLowMmioAddr:  mmio_read_data_comb = mtimecmp[31:0];
+      MtimecmpHighMmioAddr: mmio_read_data_comb = mtimecmp[63:32];
+      MsipMmioAddr:         mmio_read_data_comb = {31'b0, msip};
       default:              ;
     endcase
+  end
+
+  // Register MMIO read data to break combinational FIFO/UART paths into the core.
+  always_ff @(posedge i_clk) begin
+    if (i_rst) mmio_read_data_reg <= '0;
+    else if (mmio_read_pulse && is_mmio_registered) mmio_read_data_reg <= mmio_read_data_comb;
+  end
+
+  // Multiplexer for read data - selects between RAM and registered MMIO data
+  always_comb begin
+    data_memory_or_peripheral_read_data = data_memory_read_data;  // Default: use RAM data
+    if (is_mmio_registered) data_memory_or_peripheral_read_data = mmio_read_data_reg;
   end
 
   // write to UART
@@ -222,16 +252,14 @@ module cpu_and_mem #(
   assign o_fifo1_wr_en   = |data_memory_byte_write_enable_registered &&
                             data_memory_address_registered == Fifo1MmioAddr;
 
-  // FIFO read enable generation - pulses only for load instructions
-  assign o_fifo0_rd_en = (data_memory_address_registered == Fifo0MmioAddr) &&
-                         data_memory_read_enable;
-  assign o_fifo1_rd_en = (data_memory_address_registered == Fifo1MmioAddr) &&
-                         data_memory_read_enable;
+  // FIFO read enable generation - pulse on MMIO load (two-cycle bubble in CPU)
+  assign o_fifo0_rd_en = (data_memory_address_registered == Fifo0MmioAddr) && mmio_read_pulse;
+  assign o_fifo1_rd_en = (data_memory_address_registered == Fifo1MmioAddr) && mmio_read_pulse;
 
   // UART RX ready generation - pulses on load from UART RX data address
   // This consumes the byte from the RX FIFO
   assign o_uart_rx_ready = (data_memory_address_registered == UartRxDataMmioAddr) &&
-                           data_memory_read_enable;
+                           mmio_read_pulse;
 
   // Timer register updates
   // mtime increments every clock cycle (provides wall-clock time)

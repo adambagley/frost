@@ -82,6 +82,20 @@ from encoders.op_tables import (
     C_STORES_STACK,
     C_BRANCHES,
     C_JUMPS,
+    # F extension (floating-point)
+    FP_ARITH_2OP,
+    FP_ARITH_1OP,
+    FP_FMA,
+    FP_SGNJ,
+    FP_MINMAX,
+    FP_CMP,
+    FP_CVT_F2I,
+    FP_CVT_I2F,
+    FP_MV_F2I,
+    FP_MV_I2F,
+    FP_CLASS,
+    FP_LOADS,
+    FP_STORES,
 )
 from encoders.compressed_encode import enc_c_nop
 from utils.memory_utils import generate_aligned_immediate
@@ -95,19 +109,49 @@ class InstructionParams(NamedTuple):
     """
 
     operation: str
-    """Instruction mnemonic (e.g., "add", "lw", "beq", "csrrs")."""
+    """Instruction mnemonic (e.g., "add", "lw", "beq", "csrrs", "fadd.s")."""
     destination_register: int
-    """Destination register index (rd, 0-31)."""
+    """Destination register index (rd, 0-31). For FP ops, may be FP register."""
     source_register_1: int
-    """First source register index (rs1, 0-31)."""
+    """First source register index (rs1, 0-31). For FP ops, may be FP register."""
     source_register_2: int
-    """Second source register index (rs2, 0-31)."""
+    """Second source register index (rs2, 0-31). For FP ops, may be FP register."""
     immediate: int
     """Immediate value for I-type instructions."""
     branch_offset: int | None
     """Branch/jump offset for B-type and J-type (None for others)."""
     csr_address: int | None = None
     """CSR address for Zicsr instructions (None for others)."""
+    source_register_3: int = 0
+    """Third source register for FMA instructions (rs3, 0-31)."""
+
+
+# Sets of all FP operations grouped by result destination type
+FP_OPS_TO_FP_REG = set(
+    list(FP_ARITH_2OP.keys())
+    + list(FP_ARITH_1OP.keys())
+    + list(FP_FMA.keys())
+    + list(FP_SGNJ.keys())
+    + list(FP_MINMAX.keys())
+    + list(FP_CVT_I2F.keys())
+    + list(FP_MV_I2F.keys())
+    + list(FP_LOADS.keys())
+)
+"""Operations that write results to FP register file."""
+
+FP_OPS_TO_INT_REG = set(
+    list(FP_CMP.keys())
+    + list(FP_CVT_F2I.keys())
+    + list(FP_MV_F2I.keys())
+    + list(FP_CLASS.keys())
+)
+"""Operations that write results to integer register file."""
+
+FP_OPS_NO_WRITE = set(FP_STORES.keys())
+"""Operations that don't write any register (FP stores)."""
+
+ALL_FP_OPS = FP_OPS_TO_FP_REG | FP_OPS_TO_INT_REG | FP_OPS_NO_WRITE
+"""All floating-point operations."""
 
 
 class InstructionGenerator:
@@ -120,7 +164,7 @@ class InstructionGenerator:
 
     @staticmethod
     def get_all_operations() -> list[str]:
-        """Get list of all supported RISC-V operations.
+        """Get list of all supported RISC-V integer operations.
 
         Returns:
             List of operation mnemonics (e.g., ['add', 'sub', 'lw', ...])
@@ -143,6 +187,31 @@ class InstructionGenerator:
             + list(AMO.keys())
             # Note: LR.W/SC.W excluded from random tests - reservation tracking
             # is complex with random instruction sequences. Use directed tests.
+        )
+
+    @staticmethod
+    def get_fp_operations() -> list[str]:
+        """Get list of all supported F extension floating-point operations.
+
+        Returns:
+            List of FP operation mnemonics (e.g., ['fadd.s', 'fmul.s', ...])
+
+        Note:
+            Sorted for deterministic ordering across runs (sets have
+            non-deterministic iteration order without PYTHONHASHSEED).
+        """
+        return sorted(ALL_FP_OPS)
+
+    @staticmethod
+    def get_all_operations_with_fp() -> list[str]:
+        """Get list of all supported RISC-V operations including FP.
+
+        Returns:
+            List of all operation mnemonics including both integer and FP ops.
+        """
+        return (
+            InstructionGenerator.get_all_operations()
+            + InstructionGenerator.get_fp_operations()
         )
 
     @staticmethod
@@ -289,6 +358,110 @@ class InstructionGenerator:
         )
 
     @staticmethod
+    def generate_random_fp_instruction(
+        int_register_file_state: list[int],
+        fp_register_file_state: list[int],
+        constrain_to_memory_size: int | None = None,
+    ) -> InstructionParams:
+        """Generate random F extension floating-point instruction parameters.
+
+        Generates a random FP instruction with properly constrained operands.
+        FP instructions use different register files depending on the operation:
+        - FP arithmetic: reads FP regs, writes FP reg
+        - FP compare: reads FP regs, writes INT reg (0 or 1)
+        - FP convert F->I: reads FP reg, writes INT reg
+        - FP convert I->F: reads INT reg, writes FP reg
+        - FP move F->I: reads FP reg (bits), writes INT reg (bits)
+        - FP move I->F: reads INT reg (bits), writes FP reg (bits)
+        - FP load: reads INT reg (addr), writes FP reg
+        - FP store: reads INT reg (addr) + FP reg (data), no write
+
+        Args:
+            int_register_file_state: Current integer register file values (32 entries)
+            fp_register_file_state: Current FP register file values (32 entries)
+            constrain_to_memory_size: If provided, constrains memory addresses
+
+        Returns:
+            InstructionParams with FP instruction details
+        """
+        fp_operations = InstructionGenerator.get_fp_operations()
+        operation = random.choice(fp_operations)
+
+        # Default values - will be overwritten based on instruction type
+        destination_register = random.randint(0, 31)
+        source_register_1 = random.randint(0, 31)
+        source_register_2 = random.randint(0, 31)
+        source_register_3 = random.randint(0, 31)
+        immediate_value = 0
+
+        # Handle different FP instruction types
+        if operation in FP_LOADS:
+            # FLW: rd=FP, rs1=INT (base address), imm=offset
+            # Need word-aligned address
+            immediate_value = generate_aligned_immediate(
+                int_register_file_state[source_register_1],
+                WORD_ALIGNMENT,
+                IMM_12BIT_MIN,
+                IMM_12BIT_MAX,
+                constrain_to_memory_size,
+            )
+        elif operation in FP_STORES:
+            # FSW: rs2=FP (data), rs1=INT (base address), imm=offset
+            # Need word-aligned address
+            immediate_value = generate_aligned_immediate(
+                int_register_file_state[source_register_1],
+                WORD_ALIGNMENT,
+                IMM_12BIT_MIN,
+                IMM_12BIT_MAX,
+                constrain_to_memory_size,
+            )
+        # Other FP ops don't use immediates
+
+        return InstructionParams(
+            operation=operation,
+            destination_register=destination_register,
+            source_register_1=source_register_1,
+            source_register_2=source_register_2,
+            immediate=immediate_value,
+            branch_offset=None,
+            csr_address=None,
+            source_register_3=source_register_3,
+        )
+
+    @staticmethod
+    def generate_random_instruction_with_fp(
+        int_register_file_state: list[int],
+        fp_register_file_state: list[int],
+        force_one_address: bool = False,
+        constrain_to_memory_size: int | None = None,
+        fp_probability: float = 0.3,
+    ) -> InstructionParams:
+        """Generate random instruction, potentially FP, with given probability.
+
+        Args:
+            int_register_file_state: Current integer register file values
+            fp_register_file_state: Current FP register file values
+            force_one_address: If True, force simple address calculation
+            constrain_to_memory_size: Constrain memory addresses to this range
+            fp_probability: Probability (0.0-1.0) of generating FP instruction
+
+        Returns:
+            InstructionParams for either integer or FP instruction
+        """
+        if random.random() < fp_probability:
+            return InstructionGenerator.generate_random_fp_instruction(
+                int_register_file_state,
+                fp_register_file_state,
+                constrain_to_memory_size,
+            )
+        else:
+            return InstructionGenerator.generate_random_instruction(
+                int_register_file_state,
+                force_one_address,
+                constrain_to_memory_size,
+            )
+
+    @staticmethod
     def encode_instruction(
         operation: str,
         destination_register: int,
@@ -297,19 +470,21 @@ class InstructionGenerator:
         immediate_value: int,
         branch_offset: int | None,
         csr_address: int | None = None,
+        source_register_3: int = 0,
     ) -> int:
         """Encode RISC-V instruction into 32-bit binary format.
 
         Selects appropriate encoding function based on instruction type and format.
 
         Args:
-            operation: Instruction mnemonic (e.g., "add", "lw", "beq", "csrrs")
+            operation: Instruction mnemonic (e.g., "add", "lw", "beq", "csrrs", "fadd.s")
             destination_register: Destination register index (0-31)
             source_register_1: First source register index (0-31)
             source_register_2: Second source register index (0-31)
             immediate_value: Immediate value for I-type instructions
             branch_offset: Branch/jump offset (for B-type and J-type)
             csr_address: CSR address for Zicsr instructions (e.g., 0xC00 for cycle)
+            source_register_3: Third source register for FMA instructions (0-31)
 
         Returns:
             32-bit encoded instruction
@@ -406,6 +581,76 @@ class InstructionGenerator:
             # These take no operands - fixed encodings
             encoder_function = TRAP_INSTRS[operation]
             return encoder_function()
+        # F extension (floating-point) instruction encoding
+        elif operation in FP_ARITH_2OP:
+            # Two-operand FP arithmetic (fadd.s, fsub.s, fmul.s, fdiv.s)
+            encoder_function, _ = FP_ARITH_2OP[operation]
+            return encoder_function(
+                destination_register, source_register_1, source_register_2
+            )
+        elif operation in FP_ARITH_1OP:
+            # Single-operand FP arithmetic (fsqrt.s)
+            encoder_function, _ = FP_ARITH_1OP[operation]
+            return encoder_function(destination_register, source_register_1)
+        elif operation in FP_FMA:
+            # Fused multiply-add (fmadd.s, fmsub.s, fnmadd.s, fnmsub.s)
+            encoder_function, _ = FP_FMA[operation]
+            return encoder_function(
+                destination_register,
+                source_register_1,
+                source_register_2,
+                source_register_3,
+            )
+        elif operation in FP_SGNJ:
+            # Sign injection (fsgnj.s, fsgnjn.s, fsgnjx.s)
+            encoder_function, _ = FP_SGNJ[operation]
+            return encoder_function(
+                destination_register, source_register_1, source_register_2
+            )
+        elif operation in FP_MINMAX:
+            # Min/max (fmin.s, fmax.s)
+            encoder_function, _ = FP_MINMAX[operation]
+            return encoder_function(
+                destination_register, source_register_1, source_register_2
+            )
+        elif operation in FP_CMP:
+            # Comparison (feq.s, flt.s, fle.s) - result to integer register
+            encoder_function, _ = FP_CMP[operation]
+            return encoder_function(
+                destination_register, source_register_1, source_register_2
+            )
+        elif operation in FP_CVT_F2I:
+            # FP to integer conversion (fcvt.w.s, fcvt.wu.s)
+            encoder_function, _ = FP_CVT_F2I[operation]
+            return encoder_function(destination_register, source_register_1)
+        elif operation in FP_CVT_I2F:
+            # Integer to FP conversion (fcvt.s.w, fcvt.s.wu)
+            encoder_function, _ = FP_CVT_I2F[operation]
+            return encoder_function(destination_register, source_register_1)
+        elif operation in FP_MV_F2I:
+            # FP bits to integer move (fmv.x.w)
+            encoder_function, _ = FP_MV_F2I[operation]
+            return encoder_function(destination_register, source_register_1)
+        elif operation in FP_MV_I2F:
+            # Integer bits to FP move (fmv.w.x)
+            encoder_function, _ = FP_MV_I2F[operation]
+            return encoder_function(destination_register, source_register_1)
+        elif operation in FP_CLASS:
+            # Classify (fclass.s)
+            encoder_function, _ = FP_CLASS[operation]
+            return encoder_function(destination_register, source_register_1)
+        elif operation in FP_LOADS:
+            # FP load (flw)
+            encoder_function, _ = FP_LOADS[operation]
+            return encoder_function(
+                destination_register, source_register_1, immediate_value
+            )
+        elif operation in FP_STORES:
+            # FP store (fsw)
+            encoder_function = FP_STORES[operation]
+            return encoder_function(
+                source_register_2, source_register_1, immediate_value
+            )
         else:
             raise RuntimeError(f"Unknown operation: {operation}")
 

@@ -64,17 +64,21 @@ module pd_stage #(
   // ===========================================================================
   // Select final instruction based on selection signals from IF stage.
   // Selection signals are already registered at IF→PD boundary.
+  // Use a priority mux to avoid relying on one-hot guarantees for sel_*.
 
-  logic sel_32bit;
-  assign sel_32bit = !i_from_if_to_pd.sel_nop && !i_from_if_to_pd.sel_spanning &&
-                     !i_from_if_to_pd.sel_compressed;
-
-  // One-hot parallel OR mux for minimal depth
   logic [31:0] final_instruction;
-  assign final_instruction = ({32{i_from_if_to_pd.sel_nop}} & riscv_pkg::NOP) |
-                             ({32{i_from_if_to_pd.sel_spanning}} & i_from_if_to_pd.spanning_instr) |
-                             ({32{i_from_if_to_pd.sel_compressed}} & decompressed_instr) |
-                             ({32{sel_32bit}} & i_from_if_to_pd.effective_instr);
+  logic [31:0] instruction_non_nop;
+
+  always_comb begin
+    if (i_from_if_to_pd.sel_spanning) instruction_non_nop = i_from_if_to_pd.spanning_instr;
+    else if (i_from_if_to_pd.sel_compressed) instruction_non_nop = decompressed_instr;
+    else instruction_non_nop = i_from_if_to_pd.effective_instr;
+  end
+
+  always_comb begin
+    if (i_from_if_to_pd.sel_nop) final_instruction = riscv_pkg::NOP;
+    else final_instruction = instruction_non_nop;
+  end
 
   // ===========================================================================
   // Early Source Register Extraction (Timing Optimized)
@@ -92,10 +96,13 @@ module pd_stage #(
 
   logic [4:0] source_reg_1;
   logic [4:0] source_reg_2;
+  logic [4:0] fp_source_reg_3;  // F extension: rs3 for FMA instructions
 
   // Extract from final instruction - bits [19:15] for rs1, bits [24:20] for rs2
   assign source_reg_1 = final_instruction[19:15];
   assign source_reg_2 = final_instruction[24:20];
+  // F extension: rs3 for FMA is in bits [31:27] (R4-type format)
+  assign fp_source_reg_3 = final_instruction[31:27];
 
   // ===========================================================================
   // Pipeline Register: PD → ID
@@ -110,6 +117,7 @@ module pd_stage #(
       o_from_pd_to_id.link_address               <= '0;
       o_from_pd_to_id.source_reg_1_early         <= 5'd0;
       o_from_pd_to_id.source_reg_2_early         <= 5'd0;
+      o_from_pd_to_id.fp_source_reg_3_early      <= 5'd0;  // F extension: FMA rs3
       // Branch prediction metadata
       o_from_pd_to_id.btb_hit                    <= 1'b0;
       o_from_pd_to_id.btb_predicted_taken        <= 1'b0;
@@ -127,6 +135,7 @@ module pd_stage #(
       // Early source registers for forwarding/hazard timing
       o_from_pd_to_id.source_reg_1_early <= i_pipeline_ctrl.flush ? 5'd0 : source_reg_1;
       o_from_pd_to_id.source_reg_2_early <= i_pipeline_ctrl.flush ? 5'd0 : source_reg_2;
+      o_from_pd_to_id.fp_source_reg_3_early <= i_pipeline_ctrl.flush ? 5'd0 : fp_source_reg_3;
       // Branch prediction metadata - clear on flush (prediction for flushed instr is invalid)
       o_from_pd_to_id.btb_hit <= i_pipeline_ctrl.flush ? 1'b0 : i_from_if_to_pd.btb_hit;
       o_from_pd_to_id.btb_predicted_taken <= i_pipeline_ctrl.flush ? 1'b0 :

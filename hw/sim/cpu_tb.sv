@@ -52,6 +52,9 @@ module cpu_tb
   logic pipeline_stall_from_cpu;  // Stall signal monitoring (registered, 1-cycle delay)
   logic pipeline_stall_comb;  // Stall signal (combinational, immediate)
   logic reset_to_cpu;  // Reset signal monitoring
+  logic o_mmio_read_pulse;  // Unused in testbench; required for CPU .* connection
+  logic [31:0] o_mmio_load_addr;  // Unused in testbench; required for CPU .* connection
+  logic o_mmio_load_valid;  // Unused in testbench; required for CPU .* connection
 
   // Interrupt and timer signals for CPU (controllable from testbench)
   // Use reg type to allow testbench to drive values via force/deposit

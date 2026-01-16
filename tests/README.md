@@ -50,6 +50,8 @@ Primary test runner for RTL simulations using Cocotb. Supports both standalone e
 | `strings_test`      | String library test suite                                                |
 | `packet_parser`     | FIX protocol message parser                                              |
 | `c_ext_test`        | C extension (compressed instruction) test                                |
+| `cf_ext_test`       | Compressed floating-point (C.FLW/C.FSW) test                             |
+| `fpu_test`          | FPU compliance test suite (F extension)                                  |
 | `call_stress`       | Function call stress test                                                |
 | `spanning_test`     | Instruction spanning boundary test                                       |
 | `print_clock_speed` | Clock speed measurement utility                                          |

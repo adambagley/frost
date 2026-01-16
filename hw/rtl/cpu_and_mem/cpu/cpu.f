@@ -1,6 +1,6 @@
 # RISC-V CPU core file list (6-stage pipeline)
-# RV32IMAB + Zicsr, with full forwarding and L0 cache
-# Note: B = Zba + Zbb + Zbs (full bit manipulation extension)
+# RV32IMAFB + Zicsr, with full forwarding and L0 cache
+# Note: F = single-precision floating-point, B = Zba + Zbb + Zbs
 
 # Package with all type definitions and pipeline interconnect structures
 $(ROOT)/hw/rtl/cpu_and_mem/cpu/riscv_pkg.sv

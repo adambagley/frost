@@ -34,7 +34,8 @@ Why Use Monitors:
     - Automatic synchronization (monitors wait for valid signals)
 
 Monitors Provided:
-    - regfile_monitor: Verifies register file writes (x1-x31, excluding x0)
+    - regfile_monitor: Verifies integer register file writes (x1-x31, excluding x0)
+    - fp_regfile_monitor: Verifies FP register file writes (f0-f31, all writeable)
     - pc_monitor: Verifies program counter updates
 
 Note:
@@ -186,6 +187,57 @@ class ProgramCounterMonitor(Monitor[int]):
         return None
 
 
+class FPRegisterFileMonitor(Monitor[list[int]]):
+    """Monitor for FP register file verification (F extension).
+
+    Unlike the integer register file where x0 is hardwired to zero,
+    all 32 FP registers (f0-f31) are fully writeable and must be verified.
+    """
+
+    def __init__(
+        self,
+        dut: Any,
+        expected_queue: list[list[int]],
+        signal_paths: DUTSignalPaths | None = None,
+    ) -> None:
+        """Initialize FP register file monitor.
+
+        Args:
+            dut: Device under test
+            expected_queue: Queue of expected FP register file states
+            signal_paths: Optional custom signal paths
+        """
+        super().__init__(dut, expected_queue, "FP Register file mismatch")
+        paths = signal_paths or DUTSignalPaths()
+
+        # Navigate to FP register file RAM once
+        obj = dut
+        for attr in paths.fp_regfile_ram_fs1_path.split("."):
+            obj = getattr(obj, attr)
+        self._ram = obj
+
+    def is_valid(self) -> bool:
+        """Check if FP register file output is valid."""
+        return bool(self.dut.o_vld.value)
+
+    def read_actual(self) -> list[int]:
+        """Read all FP register values from hardware."""
+        return [int(self._ram[i].value) for i in range(NUM_REGISTERS)]
+
+    def compare(self, actual: list[int], expected: list[int]) -> str | None:
+        """Compare actual and expected FP register file states.
+
+        Unlike integer registers where x0 is always 0, all FP registers
+        (f0-f31) must be compared since they are all writeable.
+        """
+        for reg in range(NUM_REGISTERS):  # Start from f0, not f1
+            hw_val = actual[reg]
+            sw_val = expected[reg] & MASK32
+            if hw_val != sw_val:
+                return f"FP Register f{reg}: DUT 0x{hw_val:08x} EXP 0x{sw_val:08x}"
+        return None
+
+
 # Standalone functions for backward compatibility
 async def regfile_monitor(
     dut: Any,
@@ -215,4 +267,25 @@ async def pc_monitor(dut: Any, expected_queue: list[int]) -> None:
     being fetched. Waits for the PC valid signal before checking values.
     """
     monitor = ProgramCounterMonitor(dut, expected_queue)
+    await monitor.run()
+
+
+async def fp_regfile_monitor(
+    dut: Any,
+    expected_queue: list[list[int]],
+    signal_paths: DUTSignalPaths | None = None,
+) -> None:
+    """Monitor and validate FP register file values written by the DUT.
+
+    Monitors the FP register file (32 RISC-V F extension registers f0-f31) and compares
+    hardware values against expected software model values. Unlike the integer register
+    file where x0 is hardwired to zero, all FP registers are fully writeable.
+    The monitor waits for the output valid signal before checking values.
+
+    Args:
+        dut: Device under test
+        expected_queue: Queue of expected FP register file states
+        signal_paths: Optional custom signal paths. If None, uses defaults.
+    """
+    monitor = FPRegisterFileMonitor(dut, expected_queue, signal_paths)
     await monitor.run()

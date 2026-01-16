@@ -22,15 +22,15 @@ SIM             ?= verilator
 TOPLEVEL_LANG   ?= verilog
 # Top-level module name for simulation
 TOPLEVEL        ?= cpu_tb
-# Python test module to run
-MODULE          ?= cocotb_tests.test_cpu
+# Python test module(s) to run (comma-separated for multiple)
+COCOTB_TEST_MODULES ?= cocotb_tests.test_cpu
 # Git repository root (with fallback for Docker/non-git contexts)
 ROOT            ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo /workspace)
 # Whether to generate a waveform file
 WAVES           ?= 0
 
 # Export variables for Cocotb
-export TOPLEVEL MODULE TOPLEVEL_LANG SIM ROOT
+export TOPLEVEL COCOTB_TEST_MODULES TOPLEVEL_LANG SIM ROOT
 
 # Timer speedup for simulation (1000x faster than real-time)
 # This makes FreeRTOS and timer-based tests complete much faster in simulation
@@ -77,10 +77,11 @@ ifeq ($(SIM),verilator)
 	export VERILATOR_MAKE_FLAGS := -j$(NUMBER_OF_CPU_CORES)
 
 	# Extra verilator args: parallel verilation + optional waveforms
+	# -Wno-UNOPTFLAT: Suppress circular combinational logic warnings from FPU stall feedback
 	ifeq ($(WAVES),1)
-		export EXTRA_ARGS := -j $(NUMBER_OF_CPU_CORES) --trace-fst --trace-structs
+		export EXTRA_ARGS := -j $(NUMBER_OF_CPU_CORES) --trace-fst --trace-structs -Wno-UNOPTFLAT
 	else
-		export EXTRA_ARGS := -j $(NUMBER_OF_CPU_CORES)
+		export EXTRA_ARGS := -j $(NUMBER_OF_CPU_CORES) -Wno-UNOPTFLAT
 	endif
 endif
 

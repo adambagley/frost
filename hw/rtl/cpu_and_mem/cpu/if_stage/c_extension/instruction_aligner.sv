@@ -156,7 +156,7 @@ module instruction_aligner #(
   // ===========================================================================
   // Instruction Selection Signals
   // ===========================================================================
-  // Pre-compute select signals in parallel for flat mux structure in PD stage.
+  // Pre-compute select signals in parallel for PD stage selection.
   // Decompression has been moved to PD stage for timing.
 
   // Consolidate all NOP-producing conditions
@@ -170,7 +170,9 @@ module instruction_aligner #(
       (i_pc_reg[1] && !o_is_compressed && !i_spanning_in_progress);  // 32-bit spanning first cycle
 
   assign o_sel_spanning = i_spanning_in_progress && !i_spanning_to_halfword_registered;
-  assign o_sel_compressed = o_is_compressed && !o_sel_nop && !o_sel_spanning;
+  // PD stage applies priority (NOP > spanning > compressed > 32-bit),
+  // so sel_compressed does not need to be gated by sel_nop here.
+  assign o_sel_compressed = o_is_compressed && !o_sel_spanning;
 
   // Pre-compute spanning instruction once (for PD stage)
   assign o_spanning_instr = {i_spanning_second_half, i_spanning_buffer};

@@ -81,7 +81,15 @@ package riscv_pkg;
     OPC_OP       = 7'b0110011,
     OPC_MISC_MEM = 7'b0001111,  // FENCE, FENCE.I (Zifencei)
     OPC_CSR      = 7'b1110011,
-    OPC_AMO      = 7'b0101111   // A extension (atomics)
+    OPC_AMO      = 7'b0101111,  // A extension (atomics)
+    // F extension (single-precision floating-point)
+    OPC_LOAD_FP  = 7'b0000111,  // FLW
+    OPC_STORE_FP = 7'b0100111,  // FSW
+    OPC_FMADD    = 7'b1000011,  // FMADD.S
+    OPC_FMSUB    = 7'b1000111,  // FMSUB.S
+    OPC_FNMSUB   = 7'b1001011,  // FNMSUB.S
+    OPC_FNMADD   = 7'b1001111,  // FNMADD.S
+    OPC_OP_FP    = 7'b1010011   // FADD.S, FSUB.S, FMUL.S, etc.
   } opc_e;
 
   // ===========================================================================
@@ -210,7 +218,34 @@ package riscv_pkg;
     AMOMIN_W,   // Atomic minimum (signed)
     AMOMAX_W,   // Atomic maximum (signed)
     AMOMINU_W,  // Atomic minimum (unsigned)
-    AMOMAXU_W   // Atomic maximum (unsigned)
+    AMOMAXU_W,  // Atomic maximum (unsigned)
+    // F extension (single-precision floating-point)
+    FLW,        // Load float
+    FSW,        // Store float
+    FADD_S,     // FP add
+    FSUB_S,     // FP subtract
+    FMUL_S,     // FP multiply
+    FDIV_S,     // FP divide
+    FSQRT_S,    // FP square root
+    FMADD_S,    // FP fused multiply-add
+    FMSUB_S,    // FP fused multiply-subtract
+    FNMADD_S,   // FP negated fused multiply-add
+    FNMSUB_S,   // FP negated fused multiply-subtract
+    FSGNJ_S,    // FP sign inject
+    FSGNJN_S,   // FP sign inject negated
+    FSGNJX_S,   // FP sign inject XOR
+    FMIN_S,     // FP minimum
+    FMAX_S,     // FP maximum
+    FCVT_W_S,   // FP to signed int
+    FCVT_WU_S,  // FP to unsigned int
+    FCVT_S_W,   // Signed int to FP
+    FCVT_S_WU,  // Unsigned int to FP
+    FMV_X_W,    // Move FP bits to int reg
+    FMV_W_X,    // Move int bits to FP reg
+    FEQ_S,      // FP equal
+    FLT_S,      // FP less than
+    FLE_S,      // FP less than or equal
+    FCLASS_S    // FP classify
   } instr_op_e;
 
   // ===========================================================================
@@ -249,6 +284,37 @@ package riscv_pkg;
   localparam bit [11:0] CsrMip = 12'h344;  // Machine interrupt pending
   // Machine information CSRs (read-only)
   localparam bit [11:0] CsrMhartid = 12'hF14;  // Hardware thread ID (always 0 for single-core)
+
+  // F extension: Floating-point CSRs
+  localparam bit [11:0] CsrFflags = 12'h001;  // FP exception flags (NV, DZ, OF, UF, NX)
+  localparam bit [11:0] CsrFrm = 12'h002;  // FP rounding mode
+  localparam bit [11:0] CsrFcsr = 12'h003;  // FP control/status (frm[7:5] + fflags[4:0])
+
+  // F extension: Rounding modes
+  typedef enum bit [2:0] {
+    FRM_RNE = 3'b000,  // Round to Nearest, ties to Even
+    FRM_RTZ = 3'b001,  // Round towards Zero
+    FRM_RDN = 3'b010,  // Round Down (towards -inf)
+    FRM_RUP = 3'b011,  // Round Up (towards +inf)
+    FRM_RMM = 3'b100,  // Round to Nearest, ties to Max Magnitude
+    FRM_DYN = 3'b111   // Dynamic (use frm CSR)
+  } fp_rounding_mode_e;
+
+  // F extension: Exception flags (sticky, accumulated in fflags CSR)
+  typedef struct packed {
+    logic nv;  // [4] Invalid operation (e.g., sqrt(-1), 0/0, inf-inf)
+    logic dz;  // [3] Divide by zero
+    logic of;  // [2] Overflow (result too large for format)
+    logic uf;  // [1] Underflow (tiny non-zero result)
+    logic nx;  // [0] Inexact (rounding occurred)
+  } fp_flags_t;
+
+  // IEEE 754 single-precision special value constants
+  localparam bit [31:0] FpPosZero = 32'h0000_0000;  // +0.0
+  localparam bit [31:0] FpNegZero = 32'h8000_0000;  // -0.0
+  localparam bit [31:0] FpPosInf = 32'h7F80_0000;  // +infinity
+  localparam bit [31:0] FpNegInf = 32'hFF80_0000;  // -infinity
+  localparam bit [31:0] FpCanonicalNan = 32'h7FC0_0000;  // Canonical quiet NaN
 
   // mstatus bit positions (RV32)
   localparam int unsigned MstatusMieBit = 3;  // Machine Interrupt Enable
@@ -343,20 +409,23 @@ package riscv_pkg;
   // Control signals distributed to all pipeline stages
   typedef struct packed {
     logic reset;
-    logic stall;                      // Freeze pipeline (don't advance)
-    logic stall_registered;           // Stall signal from previous cycle
+    logic stall;  // Freeze pipeline (don't advance)
+    logic stall_registered;  // Stall signal from previous cycle
     logic stall_for_load_use_hazard;  // Stall due to load-use dependency
-    logic stall_for_trap_check;       // Stall conditions for trap unit (before trap/mret gating)
-    logic flush;                      // Clear pipeline (insert bubble/NOP)
-    logic amo_wb_write_enable;        // Force regfile write for AMO result
+    logic stall_for_fp_load_ma_hazard;  // Stall: FP load in MA feeds multi-cycle FP op
+    logic stall_for_trap_check;  // Stall conditions for trap unit (before trap/mret gating)
+    logic flush;  // Clear pipeline (insert bubble/NOP)
+    logic amo_wb_write_enable;  // Force regfile write for AMO result
     // Registered trap/mret signals for timing optimization
     // These break the path from EX stage exception detection through IF stage
-    logic trap_taken_registered;      // trap_taken from previous cycle
-    logic mret_taken_registered;      // mret_taken from previous cycle
+    logic trap_taken_registered;  // trap_taken from previous cycle
+    logic mret_taken_registered;  // mret_taken from previous cycle
     // TIMING OPTIMIZATION: Raw hazard detection without multiply precedence check.
     // Used by AMO unit to break the path: multiply_completing → stall_for_mul_div
     // → stall_for_load_use_hazard → stall_excluding_amo
-    logic load_use_hazard_detected;   // Raw load-use hazard (no multiply precedence)
+    logic load_use_hazard_detected;  // Raw load-use hazard (no multiply precedence)
+    // F extension: FPU in-flight hazard stall (RAW hazard with pipelined FPU ops)
+    logic stall_for_fpu_inflight_hazard;
     // NOTE: stall_excluding_amo is passed as a separate output port from hazard_resolution_unit
     // (not through this struct) to avoid false combinational loop detection in some simulators.
   } pipeline_ctrl_t;
@@ -409,6 +478,8 @@ package riscv_pkg;
     // These are extracted in parallel with decompression for better timing
     logic [4:0] source_reg_1_early;
     logic [4:0] source_reg_2_early;
+    // F extension: Early FP source reg 3 for FMA instructions (rs3 = funct7[6:2])
+    logic [4:0] fp_source_reg_3_early;
     // Branch prediction metadata (passed through from IF)
     logic btb_hit;
     logic btb_predicted_taken;
@@ -460,6 +531,19 @@ package riscv_pkg;
     logic is_wfi;  // WFI instruction
     logic is_ecall;  // ECALL instruction
     logic is_ebreak;  // EBREAK instruction
+    // F extension fields
+    logic is_fp_instruction;  // Any FP instruction
+    logic is_fp_load;  // FLW - data goes to FP regfile
+    logic is_fp_store;  // FSW
+    logic is_fp_compute;  // FP compute op (FADD, FSUB, FMUL, FDIV, FSQRT, FMA*, etc.)
+    logic is_pipelined_fp_op;  // Multi-cycle FP op that tracks inflight dest (for hazard detection)
+    logic [2:0] fp_rm;  // Rounding mode from instruction (funct3)
+    logic is_fp_to_int;  // FP to integer conversion (result goes to int reg)
+    logic is_int_to_fp;  // Integer to FP conversion (uses int rs1)
+    // FP source register data (read in ID stage)
+    logic [XLEN-1:0] fp_source_reg_1_data;
+    logic [XLEN-1:0] fp_source_reg_2_data;
+    logic [XLEN-1:0] fp_source_reg_3_data;  // For FMA instructions
     // Pre-computed link address for JAL/JALR (PC+2 or PC+4 based on compression)
     logic [XLEN-1:0] link_address;
     // Pre-computed branch/jump targets (pipeline balancing - computed in ID stage)
@@ -528,44 +612,79 @@ package riscv_pkg;
     logic [RasPtrBits-1:0] ras_restore_tos;  // TOS to restore on misprediction
     logic [RasPtrBits:0] ras_restore_valid_count;  // Valid count to restore
     logic ras_pop_after_restore;  // Pop RAS after restoring (for returns that triggered restore)
+    // F extension fields
+    logic stall_for_fpu;  // Stall for multi-cycle FP operation
+    logic fpu_completing_next_cycle;  // FPU result will be valid next cycle
+    logic [XLEN-1:0] fp_result;  // FP computation result
+    fp_flags_t fp_flags;  // FP exception flags from this operation
+    logic fp_regfile_write_enable;  // Write to FP register file
+    logic [4:0] fp_dest_reg;  // FP destination register (for forwarding)
+    // FPU in-flight destination registers (for RAW hazard detection)
+    logic [4:0] fpu_inflight_dest_1;  // 3-cycle ops: 2 cycles remaining
+    logic [4:0] fpu_inflight_dest_2;  // 3-cycle ops: 1 cycle remaining
+    logic [4:0] fpu_inflight_dest_3;  // FMA: 3 cycles remaining
+    logic [4:0] fpu_inflight_dest_4;  // FMA: 2 cycles remaining
+    logic [4:0] fpu_inflight_dest_5;  // FMA: 1 cycle remaining
+    logic [4:0] fpu_inflight_dest_6;  // Sequential (div/sqrt)
   } from_ex_comb_t;
 
   // Clocked signals passed from Execute (EX) stage to Memory Access (MA) stage
   typedef struct packed {
     logic [XLEN-1:0] alu_result;
-    logic            regfile_write_enable;
+    logic regfile_write_enable;
     logic [XLEN-1:0] data_memory_address;
-    instr_t          instruction;
-    logic            is_load_instruction;
-    logic            is_load_byte;
-    logic            is_load_halfword;
-    logic            is_load_unsigned;
+    instr_t instruction;
+    logic is_load_instruction;
+    logic is_load_byte;
+    logic is_load_halfword;
+    logic is_load_unsigned;
     // A extension (atomics)
-    logic            is_amo_instruction;
-    logic            is_lr;
-    logic            is_sc;
-    logic            sc_success;             // SC.W succeeded (0 goes to rd on success, 1 on fail)
-    instr_op_e       instruction_operation;  // Needed for AMO operation type
-    logic [XLEN-1:0] rs2_value;              // Needed for SC and AMO operations
+    logic is_amo_instruction;
+    logic is_lr;
+    logic is_sc;
+    logic sc_success;  // SC.W succeeded (0 goes to rd on success, 1 on fail)
+    instr_op_e instruction_operation;  // Needed for AMO operation type
+    logic [XLEN-1:0] rs2_value;  // Needed for SC and AMO operations
+    // F extension fields
+    logic is_fp_instruction;
+    logic is_fp_load;  // FLW - data goes to FP regfile
+    logic is_fp_store;  // FSW
+    logic is_fp_to_int;  // FP-to-int (FMV.X.W, FCVT.W.S, etc.) - result goes to int regfile
+    logic fp_regfile_write_enable;
+    logic [4:0] fp_dest_reg;  // FP destination register (for forwarding)
+    logic [XLEN-1:0] fp_result;  // Result from FPU
+    fp_flags_t fp_flags;  // FP exception flags
   } from_ex_to_ma_t;
 
   // Combinational signals passed from Memory Access (MA)
   typedef struct packed {
-    logic [XLEN-1:0] data_memory_read_data;    // Raw data from memory
+    logic [XLEN-1:0] data_memory_read_data;  // Raw data from memory
     logic [XLEN-1:0] data_loaded_from_memory;  // Processed load data (sign-extended, etc.)
+    // F extension: Direct BRAM output for FP load forwarding.
+    // data_memory_read_data uses registered path during stall which has race condition
+    // with BRAM timing. This direct signal bypasses that for combinational forwarding.
+    logic [XLEN-1:0] data_memory_read_data_direct;
   } from_ma_comb_t;
 
   // Clocked signals passed from Memory Access (MA) stage to Writeback (WB) stage
   typedef struct packed {
-    logic regfile_write_enable;
-    logic [XLEN-1:0] regfile_write_data;  // Final result to write back
-    instr_t instruction;
+    logic            regfile_write_enable;
+    logic [XLEN-1:0] regfile_write_data;       // Final result to write back
+    instr_t          instruction;
+    // F extension fields
+    logic            fp_regfile_write_enable;
+    logic [4:0]      fp_dest_reg;              // FP destination register (for forwarding)
+    logic [XLEN-1:0] fp_regfile_write_data;    // Final FP result to write back
+    fp_flags_t       fp_flags;                 // FP exception flags (to accumulate in fflags)
   } from_ma_to_wb_t;
 
   // Signals from L0 Cache
   typedef struct packed {
     logic cache_hit_on_load;
     logic [XLEN-1:0] data_loaded_from_cache;
+    // Registered cache hit/data for forwarding (breaks EX->cache->forwarding path).
+    logic cache_hit_on_load_reg;
+    logic [XLEN-1:0] data_loaded_from_cache_reg;
     logic cache_reset_in_progress;
   } from_cache_t;
 
@@ -578,6 +697,11 @@ package riscv_pkg;
   typedef struct packed {
     logic [XLEN-1:0] source_reg_1_value;
     logic [XLEN-1:0] source_reg_2_value;
+    // Capture bypass for int->fp conversions (FCVT.S.W/WU, FMV.W.X).
+    // When a load-use stall is asserted, provide the MA load data directly
+    // so the FPU captures the correct rs1 value at the stall edge.
+    logic            capture_bypass_int_valid;
+    logic [XLEN-1:0] capture_bypass_int_data;
   } fwd_to_ex_t;
 
   // Register file read data to Forwarding unit
@@ -585,6 +709,37 @@ package riscv_pkg;
     logic [XLEN-1:0] source_reg_1_data;
     logic [XLEN-1:0] source_reg_2_data;
   } rf_to_fwd_t;
+
+  // F extension: Forwarded FP register values to Execute stage
+  typedef struct packed {
+    logic [XLEN-1:0] fp_source_reg_1_value;
+    logic [XLEN-1:0] fp_source_reg_2_value;
+    logic [XLEN-1:0] fp_source_reg_3_value;        // For FMA instructions
+    // Combinational bypass for pipelined FPU operand capture timing:
+    // The registered forwarding signals update at the same posedge when the
+    // pipelined FPU captures operands. These combinational signals provide
+    // the correct forwarding decision for capture.
+    // MA bypass (one cycle ahead): producer in EX → consumer in ID
+    logic            capture_bypass_rs1;
+    logic            capture_bypass_rs2;
+    logic            capture_bypass_rs3;
+    logic [XLEN-1:0] capture_bypass_data;          // EX result to forward at capture
+    // WB bypass (two cycles ahead): producer in MA → consumer in ID
+    logic            capture_bypass_rs1_from_wb;
+    logic            capture_bypass_rs2_from_wb;
+    logic            capture_bypass_rs3_from_wb;
+    logic [XLEN-1:0] capture_bypass_data_wb;       // MA result to forward at capture
+    // Flag indicating the INCOMING instruction (in ID, entering EX) is a
+    // pipelined FPU operation. The bypass should only apply to these ops.
+    logic            capture_bypass_is_pipelined;
+  } fp_fwd_to_ex_t;
+
+  // F extension: FP register file read data to Forwarding unit
+  typedef struct packed {
+    logic [XLEN-1:0] fp_source_reg_1_data;
+    logic [XLEN-1:0] fp_source_reg_2_data;
+    logic [XLEN-1:0] fp_source_reg_3_data;
+  } fp_rf_to_fwd_t;
 
   // ===========================================================================
   // Section 9: A-Extension Support
@@ -742,6 +897,43 @@ package riscv_pkg;
 
     // Level 4: Final sum
     cpop32 = {26'd0, pop16[0]} + {26'd0, pop16[1]};
+  endfunction
+
+  // 64-bit CLZ using tree of 8-bit CLZ operations
+  // Scans from MSB byte (byte 7) to LSB byte (byte 0)
+  // Returns 7-bit result (0-64), optimized for FPGA timing
+  function automatic [6:0] clz64(input logic [63:0] val);
+    logic [3:0] clz_byte[8];  // CLZ result for each byte
+    logic       nz_byte [8];  // Non-zero flag for each byte
+
+    // Compute 8-bit CLZ and non-zero flags for each byte in parallel
+    for (int i = 0; i < 8; i++) begin
+      clz_byte[i] = clz8(val[i*8+:8]);
+      nz_byte[i]  = |val[i*8+:8];
+    end
+
+    // Priority scan from MSB byte (7) to LSB byte (0)
+    // Add byte offset (0, 8, 16, ..., 56) based on which byte has first set bit
+    if (nz_byte[7]) clz64 = {3'd0, clz_byte[7]};
+    else if (nz_byte[6]) clz64 = {3'd0, clz_byte[6]} + 7'd8;
+    else if (nz_byte[5]) clz64 = {3'd0, clz_byte[5]} + 7'd16;
+    else if (nz_byte[4]) clz64 = {3'd0, clz_byte[4]} + 7'd24;
+    else if (nz_byte[3]) clz64 = {3'd0, clz_byte[3]} + 7'd32;
+    else if (nz_byte[2]) clz64 = {3'd0, clz_byte[2]} + 7'd40;
+    else if (nz_byte[1]) clz64 = {3'd0, clz_byte[1]} + 7'd48;
+    else if (nz_byte[0]) clz64 = {3'd0, clz_byte[0]} + 7'd56;
+    else clz64 = 7'd64;  // All zeros
+  endfunction
+
+  // 49-bit CLZ for FMA unit - pads to 64 bits and uses tree-based clz64
+  // Input is 49-bit sum from FMA add stage, output is leading zero count (0-48)
+  // Note: Caller should handle all-zeros case separately for correct behavior
+  function automatic [5:0] clz49(input logic [48:0] val);
+    logic [6:0] clz_result;
+    clz_result = clz64({15'b0, val});
+    // Subtract padding offset (15 bits). For non-zero input, clz_result is 15-63,
+    // mapping to 0-48 after subtraction. Truncate to 6 bits (result fits in 0-48).
+    clz49 = 6'(clz_result - 7'd15);
   endfunction
 
   // BREV8: Bit-reverse each byte independently (Zbkb extension)

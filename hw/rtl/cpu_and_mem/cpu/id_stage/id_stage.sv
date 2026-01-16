@@ -39,6 +39,7 @@ module id_stage #(
     input riscv_pkg::pipeline_ctrl_t i_pipeline_ctrl,
     input riscv_pkg::from_pd_to_id_t i_from_pd_to_id,
     input riscv_pkg::rf_to_fwd_t i_rf_to_id,  // Regfile read data (combinational from PD src regs)
+    input riscv_pkg::fp_rf_to_fwd_t i_fp_rf_to_id,  // FP regfile read data (F extension)
     input riscv_pkg::from_ma_to_wb_t i_from_ma_to_wb,  // WB bypass (WB writes same cycle ID reads)
     output riscv_pkg::from_id_to_ex_t o_from_id_to_ex
 );
@@ -167,6 +168,62 @@ module id_stage #(
       .o_btb_correct_non_jalr(btb_correct_non_jalr_precomputed)
   );
 
+  // F extension - floating-point instruction detection
+  // Direct decode from opcode for timing optimization
+  logic is_fp_load_direct;  // FLW
+  logic is_fp_store_direct;  // FSW
+  logic is_fp_compute_direct;  // All F arithmetic/compare/convert ops
+  logic is_fp_fma_direct;  // FMA instructions (separate opcode)
+  logic is_fp_instruction_direct;
+
+  assign is_fp_load_direct = instruction.opcode == riscv_pkg::OPC_LOAD_FP;
+  assign is_fp_store_direct = instruction.opcode == riscv_pkg::OPC_STORE_FP;
+  assign is_fp_compute_direct = instruction.opcode == riscv_pkg::OPC_OP_FP;
+  assign is_fp_fma_direct = (instruction.opcode == riscv_pkg::OPC_FMADD) |
+                            (instruction.opcode == riscv_pkg::OPC_FMSUB) |
+                            (instruction.opcode == riscv_pkg::OPC_FNMSUB) |
+                            (instruction.opcode == riscv_pkg::OPC_FNMADD);
+  assign is_fp_instruction_direct = is_fp_load_direct | is_fp_store_direct |
+                                   is_fp_compute_direct | is_fp_fma_direct;
+
+  // FP instructions that produce integer results (write to integer regfile)
+  // FEQ, FLT, FLE: funct7[6:2]=10100, funct3 determines compare type
+  // FCLASS.S: funct7[6:2]=11100, funct3=001
+  // FCVT.W.S, FCVT.WU.S: funct7[6:2]=11000
+  // FMV.X.W: funct7[6:2]=11100, funct3=000
+  logic is_fp_to_int_direct;
+  assign is_fp_to_int_direct = is_fp_compute_direct && (
+      (instruction.funct7[6:2] == 5'b10100) |  // FEQ/FLT/FLE
+      (instruction.funct7[6:2] == 5'b11100 && instruction.funct3 == 3'b001) |  // FCLASS
+      (instruction.funct7[6:2] == 5'b11000) |  // FCVT.W.S, FCVT.WU.S
+      (instruction.funct7[6:2] == 5'b11100 && instruction.funct3 == 3'b000)  // FMV.X.W
+      );
+
+  // FP instructions that take integer source (read from integer regfile)
+  // FCVT.S.W, FCVT.S.WU: funct7[6:2]=11010
+  // FMV.W.X: funct7[6:2]=11110, funct3=000
+  logic is_int_to_fp_direct;
+  assign is_int_to_fp_direct = is_fp_compute_direct && (
+      (instruction.funct7[6:2] == 5'b11010) |  // FCVT.S.W, FCVT.S.WU
+      (instruction.funct7[6:2] == 5'b11110 && instruction.funct3 == 3'b000)  // FMV.W.X
+      );
+
+  // Pipelined FP operations (multi-cycle ops that track in-flight destinations)
+  // Used by hazard_resolution_unit to detect RAW hazards without re-decoding the operation.
+  // Includes: FADD, FSUB, FMUL, FDIV, FSQRT, and all FMA variants
+  logic is_pipelined_fp_op_direct;
+  assign is_pipelined_fp_op_direct = is_fp_fma_direct |  // All FMA ops
+      (is_fp_compute_direct && (
+          instruction.funct7[6:3] == 4'b0000 ||  // FADD.S (0000000), FSUB.S (0000100)
+      instruction.funct7[6:3] == 4'b0001 ||  // FMUL.S (0001000), FDIV.S (0001100)
+      instruction.funct7[6:2] == 5'b01011  // FSQRT.S (0101100)
+      ));
+
+  // Extract rounding mode from instruction (bits [14:12] = funct3)
+  // For FP operations, funct3 encodes rounding mode
+  logic [2:0] fp_rm_direct;
+  assign fp_rm_direct = instruction.funct3;
+
   // ===========================================================================
   // WB Bypass Logic
   // ===========================================================================
@@ -193,6 +250,35 @@ module id_stage #(
                                                       i_rf_to_id.source_reg_1_data;
   assign source_reg_2_data_bypassed = wb_bypass_rs2 ? i_from_ma_to_wb.regfile_write_data :
                                                       i_rf_to_id.source_reg_2_data;
+
+  // F extension: WB bypass for FP registers
+  // Same-cycle bypass: When WB writes to an FP register that ID is reading
+  logic fp_wb_bypass_rs1;
+  logic fp_wb_bypass_rs2;
+  logic fp_wb_bypass_rs3;
+  logic [XLEN-1:0] fp_source_reg_1_data_bypassed;
+  logic [XLEN-1:0] fp_source_reg_2_data_bypassed;
+  logic [XLEN-1:0] fp_source_reg_3_data_bypassed;
+
+  // Use fp_dest_reg instead of instruction.dest_reg because for pipelined FPU
+  // operations, the original instruction has moved on but fp_dest_reg tracks the
+  // actual destination register being written.
+  assign fp_wb_bypass_rs1 = i_from_ma_to_wb.fp_regfile_write_enable &&
+                            (i_from_ma_to_wb.fp_dest_reg ==
+                             i_from_pd_to_id.source_reg_1_early);
+  assign fp_wb_bypass_rs2 = i_from_ma_to_wb.fp_regfile_write_enable &&
+                            (i_from_ma_to_wb.fp_dest_reg ==
+                             i_from_pd_to_id.source_reg_2_early);
+  assign fp_wb_bypass_rs3 = i_from_ma_to_wb.fp_regfile_write_enable &&
+                            (i_from_ma_to_wb.fp_dest_reg ==
+                             i_from_pd_to_id.fp_source_reg_3_early);
+
+  assign fp_source_reg_1_data_bypassed = fp_wb_bypass_rs1 ? i_from_ma_to_wb.fp_regfile_write_data :
+                                                           i_fp_rf_to_id.fp_source_reg_1_data;
+  assign fp_source_reg_2_data_bypassed = fp_wb_bypass_rs2 ? i_from_ma_to_wb.fp_regfile_write_data :
+                                                           i_fp_rf_to_id.fp_source_reg_2_data;
+  assign fp_source_reg_3_data_bypassed = fp_wb_bypass_rs3 ? i_from_ma_to_wb.fp_regfile_write_data :
+                                                           i_fp_rf_to_id.fp_source_reg_3_data;
 
   // ===========================================================================
   // Source Register x0 Check Pre-computation
@@ -266,6 +352,18 @@ module id_stage #(
       // TIMING OPTIMIZATION: Pre-computed BTB verification
       o_from_id_to_ex.btb_correct_non_jalr         <= 1'b0;
       o_from_id_to_ex.btb_expected_rs1             <= '0;
+      // F extension
+      o_from_id_to_ex.is_fp_instruction            <= 1'b0;
+      o_from_id_to_ex.is_fp_load                   <= 1'b0;
+      o_from_id_to_ex.is_fp_store                  <= 1'b0;
+      o_from_id_to_ex.is_fp_compute                <= 1'b0;
+      o_from_id_to_ex.is_pipelined_fp_op           <= 1'b0;
+      o_from_id_to_ex.is_fp_to_int                 <= 1'b0;
+      o_from_id_to_ex.is_int_to_fp                 <= 1'b0;
+      o_from_id_to_ex.fp_rm                        <= 3'b0;
+      o_from_id_to_ex.fp_source_reg_1_data         <= '0;
+      o_from_id_to_ex.fp_source_reg_2_data         <= '0;
+      o_from_id_to_ex.fp_source_reg_3_data         <= '0;
     end else if (~i_pipeline_ctrl.stall) begin
       // When pipeline is not stalled, pass decoded instruction to Execute stage
       // If flushing (e.g., due to branch), insert NOP instead
@@ -328,20 +426,35 @@ module id_stage #(
       o_from_id_to_ex.btb_correct_non_jalr <= i_pipeline_ctrl.flush ? 1'b0 :
                                               btb_correct_non_jalr_precomputed;
       o_from_id_to_ex.btb_expected_rs1 <= btb_expected_rs1_precomputed;
+      // F extension - clear on flush
+      o_from_id_to_ex.is_fp_instruction <= i_pipeline_ctrl.flush ? 1'b0 : is_fp_instruction_direct;
+      o_from_id_to_ex.is_fp_load <= i_pipeline_ctrl.flush ? 1'b0 : is_fp_load_direct;
+      o_from_id_to_ex.is_fp_store <= i_pipeline_ctrl.flush ? 1'b0 : is_fp_store_direct;
+      o_from_id_to_ex.is_fp_compute <= i_pipeline_ctrl.flush ? 1'b0 :
+                                       (is_fp_compute_direct | is_fp_fma_direct);
+      o_from_id_to_ex.is_pipelined_fp_op <= i_pipeline_ctrl.flush ? 1'b0 :
+                                            is_pipelined_fp_op_direct;
+      o_from_id_to_ex.is_fp_to_int <= i_pipeline_ctrl.flush ? 1'b0 : is_fp_to_int_direct;
+      o_from_id_to_ex.is_int_to_fp <= i_pipeline_ctrl.flush ? 1'b0 : is_int_to_fp_direct;
+      o_from_id_to_ex.fp_rm <= fp_rm_direct;
     end
     // Pass immediate values and regfile data (datapath, not affected by reset - only by stall)
     if (~i_pipeline_ctrl.stall) begin
-      o_from_id_to_ex.immediate_u_type   <= immediate_u_type;
-      o_from_id_to_ex.immediate_s_type   <= immediate_s_type;
-      o_from_id_to_ex.immediate_i_type   <= immediate_i_type;
-      o_from_id_to_ex.immediate_b_type   <= immediate_b_type;
-      o_from_id_to_ex.immediate_j_type   <= immediate_j_type;
+      o_from_id_to_ex.immediate_u_type <= immediate_u_type;
+      o_from_id_to_ex.immediate_s_type <= immediate_s_type;
+      o_from_id_to_ex.immediate_i_type <= immediate_i_type;
+      o_from_id_to_ex.immediate_b_type <= immediate_b_type;
+      o_from_id_to_ex.immediate_j_type <= immediate_j_type;
       // Regfile read data (read in ID stage, with WB bypass, registered here for EX stage)
-      o_from_id_to_ex.source_reg_1_data  <= source_reg_1_data_bypassed;
-      o_from_id_to_ex.source_reg_2_data  <= source_reg_2_data_bypassed;
+      o_from_id_to_ex.source_reg_1_data <= source_reg_1_data_bypassed;
+      o_from_id_to_ex.source_reg_2_data <= source_reg_2_data_bypassed;
       // Pre-computed x0 check flags (timing optimization for forwarding unit)
       o_from_id_to_ex.source_reg_1_is_x0 <= source_reg_1_is_x0;
       o_from_id_to_ex.source_reg_2_is_x0 <= source_reg_2_is_x0;
+      // F extension: FP register file read data (with WB bypass)
+      o_from_id_to_ex.fp_source_reg_1_data <= fp_source_reg_1_data_bypassed;
+      o_from_id_to_ex.fp_source_reg_2_data <= fp_source_reg_2_data_bypassed;
+      o_from_id_to_ex.fp_source_reg_3_data <= fp_source_reg_3_data_bypassed;
     end
   end
 

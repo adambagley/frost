@@ -63,6 +63,8 @@ class TestState:
     Attributes:
         register_file_current: Register values after current writeback
         register_file_previous: Register values visible to current instruction
+        fp_register_file_current: FP register values after current writeback
+        fp_register_file_previous: FP register values visible to current instruction
         program_counter_current: PC at fetch stage
         program_counter_previous: PC at decode stage
         program_counter_two_cycles_ago: PC at writeback stage
@@ -80,7 +82,8 @@ class TestState:
         last_sc_succeeded: Whether the last SC.W instruction succeeded
         last_sc_address: Address of the last SC.W instruction
         last_sc_data: Data value of the last SC.W instruction
-        register_file_current_expected_queue: Queue for monitor verification
+        register_file_current_expected_queue: Queue for integer register verification
+        fp_register_file_current_expected_queue: Queue for FP register verification
         program_counter_expected_values_queue: Queue for PC verification
         memory_write_data_expected_queue: Queue for memory write data verification
         memory_write_address_expected_queue: Queue for memory write address verification
@@ -89,7 +92,7 @@ class TestState:
     def __init__(self) -> None:
         """Initialize test state with default values for CPU verification."""
         # ====================================================================
-        # Register File State
+        # Integer Register File State
         # ====================================================================
         # With full forwarding, instruction N sees results from all previous
         # instructions via forwarding paths (EX→ID, MA→ID, WB→ID).
@@ -97,6 +100,15 @@ class TestState:
         # 'current' = values after writeback of current instruction
         self.register_file_current: list[int] = [0] * 32
         self.register_file_previous: list[int] = [0] * 32
+
+        # ====================================================================
+        # FP Register File State (F extension)
+        # ====================================================================
+        # Same pipeline timing as integer register file.
+        # FP registers f0-f31 are separate from integer registers x0-x31.
+        # Note: Unlike x0 which is hardwired to 0, f0 is a normal register.
+        self.fp_register_file_current: list[int] = [0] * 32
+        self.fp_register_file_previous: list[int] = [0] * 32
 
         # ====================================================================
         # Program Counter State
@@ -138,6 +150,7 @@ class TestState:
         # Expected Output Queues
         # ====================================================================
         self.register_file_current_expected_queue: list[list[int]] = []
+        self.fp_register_file_current_expected_queue: list[list[int]] = []
         self.program_counter_expected_values_queue: list[int] = []
         self.memory_write_data_expected_queue: list[int] = []
         self.memory_write_address_expected_queue: list[int] = []
@@ -166,7 +179,7 @@ class TestState:
         self.program_counter_current = expected_program_counter
 
     def update_register(self, register_index: int, value: int) -> None:
-        """Update a register in the current register file state.
+        """Update a register in the current integer register file state.
 
         Args:
             register_index: Register to update (1-31, x0 is ignored)
@@ -175,12 +188,23 @@ class TestState:
         if register_index and register_index < 32:
             self.register_file_current[register_index] = value & MASK32
 
+    def update_fp_register(self, register_index: int, value: int) -> None:
+        """Update a register in the current FP register file state.
+
+        Args:
+            register_index: FP register to update (0-31, f0 is writeable unlike x0)
+            value: Value to write (will be masked to 32 bits)
+        """
+        if register_index < 32:
+            self.fp_register_file_current[register_index] = value & MASK32
+
     def advance_register_state(self) -> None:
-        """Advance register state: current becomes previous for next cycle."""
+        """Advance both integer and FP register state: current becomes previous."""
         self.register_file_previous = self.register_file_current.copy()
+        self.fp_register_file_previous = self.fp_register_file_current.copy()
 
     def queue_expected_outputs(self, expected_pc: int) -> None:
-        """Queue expected register file and PC for monitor verification.
+        """Queue expected register files (int and FP) and PC for monitor verification.
 
         Args:
             expected_pc: Expected program counter value
@@ -188,12 +212,16 @@ class TestState:
         self.register_file_current_expected_queue.append(
             self.register_file_current.copy()
         )
+        self.fp_register_file_current_expected_queue.append(
+            self.fp_register_file_current.copy()
+        )
         self.program_counter_expected_values_queue.append(expected_pc)
 
     def has_pending_expectations(self) -> bool:
         """Check if there are still expected values waiting to be verified."""
         return (
             len(self.register_file_current_expected_queue) > 0
+            or len(self.fp_register_file_current_expected_queue) > 0
             or len(self.program_counter_expected_values_queue) > 0
             or len(self.memory_write_data_expected_queue) > 0
             or len(self.memory_write_address_expected_queue) > 0

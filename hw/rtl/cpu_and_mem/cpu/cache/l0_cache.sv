@@ -82,6 +82,11 @@ module l0_cache #(
   logic [XLEN/8-1:0][7:0] cache_read_entry_ex_data_bytes;
   assign cache_read_entry_ex.data = cache_read_entry_ex_data_bytes;
 
+  logic cache_hit_on_load_comb;
+  logic [XLEN-1:0] data_loaded_from_cache_comb;
+  logic cache_hit_on_load_reg;
+  logic [XLEN-1:0] data_loaded_from_cache_reg;
+
   logic [CacheIndexWidth-1:0] cache_index_ex, cache_index_ma;
   logic [CacheTagWidth-1:0] tag_ex, tag_ma;
   logic [UnallocatedAddrBitsWidth-1:0] unallocated_address_bits_ex;
@@ -171,7 +176,7 @@ module l0_cache #(
       .i_is_load_halfword(i_from_id_to_ex.is_load_halfword),
 
       // Output
-      .o_cache_hit_on_load(o_from_cache.cache_hit_on_load)
+      .o_cache_hit_on_load(cache_hit_on_load_comb)
   );
 
   // Cache data storage - separate distributed RAM per byte for granular writes
@@ -249,13 +254,27 @@ module l0_cache #(
       .i_is_load_unsigned(i_from_id_to_ex.is_load_unsigned),
       .i_data_memory_address(i_from_ex_comb.data_memory_address),
       .i_data_memory_read_data(cache_read_entry_ex.data),
-      .o_data_loaded_from_memory(o_from_cache.data_loaded_from_cache)
+      .o_data_loaded_from_memory(data_loaded_from_cache_comb)
   );
+
+  // Register cache hit/data for forwarding (timing optimization)
+  always_ff @(posedge i_clk)
+    if (i_rst) begin
+      cache_hit_on_load_reg <= 1'b0;
+      data_loaded_from_cache_reg <= '0;
+    end else if (~i_pipeline_ctrl.stall) begin
+      cache_hit_on_load_reg <= cache_hit_on_load_comb;
+      data_loaded_from_cache_reg <= data_loaded_from_cache_comb;
+    end
 
   always_ff @(posedge i_clk)
     if (i_rst) is_memory_mapped_io_ma <= 1'b0;
     else if (~i_pipeline_ctrl.stall) is_memory_mapped_io_ma <= is_memory_mapped_io_ex;
 
+  assign o_from_cache.cache_hit_on_load = cache_hit_on_load_comb;
+  assign o_from_cache.data_loaded_from_cache = data_loaded_from_cache_comb;
+  assign o_from_cache.cache_hit_on_load_reg = cache_hit_on_load_reg;
+  assign o_from_cache.data_loaded_from_cache_reg = data_loaded_from_cache_reg;
   assign o_from_cache.cache_reset_in_progress = cache_reset_in_progress;
 
 endmodule : l0_cache

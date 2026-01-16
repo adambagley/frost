@@ -88,6 +88,33 @@ from encoders.instruction_encode import (
     enc_ebreak,
     enc_mret,
     enc_wfi,
+    # F extension (floating-point)
+    enc_flw,
+    enc_fsw,
+    enc_fadd_s,
+    enc_fsub_s,
+    enc_fmul_s,
+    enc_fdiv_s,
+    enc_fsqrt_s,
+    enc_fmadd_s,
+    enc_fmsub_s,
+    enc_fnmadd_s,
+    enc_fnmsub_s,
+    enc_fsgnj_s,
+    enc_fsgnjn_s,
+    enc_fsgnjx_s,
+    enc_fmin_s,
+    enc_fmax_s,
+    enc_fcvt_w_s,
+    enc_fcvt_wu_s,
+    enc_fcvt_s_w,
+    enc_fcvt_s_wu,
+    enc_fmv_x_w,
+    enc_fmv_w_x,
+    enc_fclass_s,
+    enc_feq_s,
+    enc_flt_s,
+    enc_fle_s,
 )
 from encoders.compressed_encode import (
     # C extension (compressed instructions)
@@ -116,6 +143,11 @@ from encoders.compressed_encode import (
     enc_c_beqz,
     enc_c_bnez,
     is_compressible_reg,
+    # C extension FP (compressed floating-point load/store)
+    enc_c_flw,
+    enc_c_fsw,
+    enc_c_flwsp,
+    enc_c_fswsp,
 )
 from models.alu_model import (
     add,
@@ -187,6 +219,39 @@ from models.alu_model import (
     amomax,
     amominu,
     amomaxu,
+)
+from models.fp_model import (
+    # F extension - arithmetic
+    fadd_s,
+    fsub_s,
+    fmul_s,
+    fdiv_s,
+    fsqrt_s,
+    fmadd_s,
+    fmsub_s,
+    fnmadd_s,
+    fnmsub_s,
+    # F extension - sign manipulation
+    fsgnj_s,
+    fsgnjn_s,
+    fsgnjx_s,
+    # F extension - min/max
+    fmin_s,
+    fmax_s,
+    # F extension - comparison
+    feq_s,
+    flt_s,
+    fle_s,
+    # F extension - conversion
+    fcvt_w_s,
+    fcvt_wu_s,
+    fcvt_s_w,
+    fcvt_s_wu,
+    # F extension - move
+    fmv_x_w,
+    fmv_w_x,
+    # F extension - classify
+    fclass_s,
 )
 
 
@@ -535,3 +600,157 @@ C_SPECIAL: dict[str, tuple[Callable, Callable]] = {
 
 # Helper to check if a register can be used in compressed instructions
 is_compressed_reg = is_compressible_reg
+
+# =============================================================================
+# C extension FP (compressed floating-point load/store)
+# =============================================================================
+#
+# These are the only compressed floating-point instructions in RV32FC:
+#   - C.FLW: Load FP word from base+offset (rd'=FP, rs1'=INT)
+#   - C.FSW: Store FP word to base+offset (rs1'=INT, rs2'=FP)
+#   - C.FLWSP: Load FP word from SP+offset (rd=FP)
+#   - C.FSWSP: Store FP word to SP+offset (rs2=FP)
+#
+# Note: The evaluator for loads is 'lw' since it loads 32 bits to FP register.
+
+# Compressed FP load (limited register set: f8-f15 for rd', x8-x15 for rs1')
+# Format: (encoder, evaluator)
+C_FP_LOADS_LIMITED: dict[str, tuple[Callable, Callable]] = {
+    "c.flw": (lambda rd, rs1, uimm: enc_c_flw(rd, rs1, uimm), lw),
+}
+
+# Compressed FP store (limited register set: x8-x15 for rs1', f8-f15 for rs2')
+# Format: encoder only (store has no return value)
+C_FP_STORES_LIMITED: dict[str, Callable] = {
+    "c.fsw": lambda rs1, rs2, uimm: enc_c_fsw(rs1, rs2, uimm),
+}
+
+# Compressed FP load from stack (full FP register set: f0-f31)
+# Format: (encoder, evaluator)
+C_FP_LOADS_STACK: dict[str, tuple[Callable, Callable]] = {
+    "c.flwsp": (lambda rd, uimm: enc_c_flwsp(rd, uimm), lw),
+}
+
+# Compressed FP store to stack (full FP register set: f0-f31)
+# Format: encoder only (store has no return value)
+C_FP_STORES_STACK: dict[str, Callable] = {
+    "c.fswsp": lambda rs2, uimm: enc_c_fswsp(rs2, uimm),
+}
+
+# =============================================================================
+# F extension (single-precision floating-point instructions)
+# =============================================================================
+#
+# The F extension adds 32 floating-point registers (f0-f31) and instructions
+# for single-precision (32-bit) IEEE 754 floating-point operations.
+#
+# FP instruction categories:
+#   - FP_ARITH_2OP: Two-operand arithmetic (rd, rs1, rs2)
+#   - FP_ARITH_1OP: Single-operand arithmetic (rd, rs1) - e.g., fsqrt
+#   - FP_FMA: Fused multiply-add (rd, rs1, rs2, rs3)
+#   - FP_SGNJ: Sign injection (rd, rs1, rs2)
+#   - FP_MINMAX: Min/max (rd, rs1, rs2)
+#   - FP_CMP: Comparison to int (rd, rs1, rs2) - result in integer reg
+#   - FP_CVT_F2I: FP to int conversion (rd=int, rs1=fp)
+#   - FP_CVT_I2F: Int to FP conversion (rd=fp, rs1=int)
+#   - FP_MV_F2I: Move FP bits to int (rd=int, rs1=fp)
+#   - FP_MV_I2F: Move int bits to FP (rd=fp, rs1=int)
+#   - FP_CLASS: Classify FP value (rd=int, rs1=fp)
+#   - FP_LOADS: Load from memory to FP reg (rd=fp, rs1=int, imm)
+#   - FP_STORES: Store FP reg to memory (rs2=fp, rs1=int, imm)
+#
+# Format: (encoder, evaluator)
+#   encoder: lambda rd, rs1, rs2 -> 32-bit instruction
+#   evaluator: lambda rs1_bits, rs2_bits -> result_bits
+
+# FP arithmetic operations (two FP operands -> FP result)
+FP_ARITH_2OP: dict[str, tuple[Callable, Callable]] = {
+    "fadd.s": (lambda rd, rs1, rs2: enc_fadd_s(rd, rs1, rs2), fadd_s),
+    "fsub.s": (lambda rd, rs1, rs2: enc_fsub_s(rd, rs1, rs2), fsub_s),
+    "fmul.s": (lambda rd, rs1, rs2: enc_fmul_s(rd, rs1, rs2), fmul_s),
+    "fdiv.s": (lambda rd, rs1, rs2: enc_fdiv_s(rd, rs1, rs2), fdiv_s),
+}
+
+# FP single-operand arithmetic (one FP operand -> FP result)
+FP_ARITH_1OP: dict[str, tuple[Callable, Callable]] = {
+    "fsqrt.s": (lambda rd, rs1: enc_fsqrt_s(rd, rs1), fsqrt_s),
+}
+
+# FP fused multiply-add (three FP operands -> FP result)
+# Format: (encoder, evaluator)
+#   encoder: lambda rd, rs1, rs2, rs3 -> 32-bit instruction
+#   evaluator: lambda rs1_bits, rs2_bits, rs3_bits -> result_bits
+FP_FMA: dict[str, tuple[Callable, Callable]] = {
+    "fmadd.s": (lambda rd, rs1, rs2, rs3: enc_fmadd_s(rd, rs1, rs2, rs3), fmadd_s),
+    "fmsub.s": (lambda rd, rs1, rs2, rs3: enc_fmsub_s(rd, rs1, rs2, rs3), fmsub_s),
+    "fnmadd.s": (lambda rd, rs1, rs2, rs3: enc_fnmadd_s(rd, rs1, rs2, rs3), fnmadd_s),
+    "fnmsub.s": (lambda rd, rs1, rs2, rs3: enc_fnmsub_s(rd, rs1, rs2, rs3), fnmsub_s),
+}
+
+# FP sign injection (two FP operands -> FP result)
+FP_SGNJ: dict[str, tuple[Callable, Callable]] = {
+    "fsgnj.s": (lambda rd, rs1, rs2: enc_fsgnj_s(rd, rs1, rs2), fsgnj_s),
+    "fsgnjn.s": (lambda rd, rs1, rs2: enc_fsgnjn_s(rd, rs1, rs2), fsgnjn_s),
+    "fsgnjx.s": (lambda rd, rs1, rs2: enc_fsgnjx_s(rd, rs1, rs2), fsgnjx_s),
+}
+
+# FP min/max (two FP operands -> FP result)
+FP_MINMAX: dict[str, tuple[Callable, Callable]] = {
+    "fmin.s": (lambda rd, rs1, rs2: enc_fmin_s(rd, rs1, rs2), fmin_s),
+    "fmax.s": (lambda rd, rs1, rs2: enc_fmax_s(rd, rs1, rs2), fmax_s),
+}
+
+# FP comparison (two FP operands -> integer result: 0 or 1)
+# Note: Result goes to INTEGER register, not FP register
+FP_CMP: dict[str, tuple[Callable, Callable]] = {
+    "feq.s": (lambda rd, rs1, rs2: enc_feq_s(rd, rs1, rs2), feq_s),
+    "flt.s": (lambda rd, rs1, rs2: enc_flt_s(rd, rs1, rs2), flt_s),
+    "fle.s": (lambda rd, rs1, rs2: enc_fle_s(rd, rs1, rs2), fle_s),
+}
+
+# FP to integer conversion (FP operand -> integer result)
+# Note: Result goes to INTEGER register
+FP_CVT_F2I: dict[str, tuple[Callable, Callable]] = {
+    "fcvt.w.s": (lambda rd, rs1: enc_fcvt_w_s(rd, rs1), fcvt_w_s),
+    "fcvt.wu.s": (lambda rd, rs1: enc_fcvt_wu_s(rd, rs1), fcvt_wu_s),
+}
+
+# Integer to FP conversion (integer operand -> FP result)
+# Note: Source is INTEGER register, result goes to FP register
+FP_CVT_I2F: dict[str, tuple[Callable, Callable]] = {
+    "fcvt.s.w": (lambda rd, rs1: enc_fcvt_s_w(rd, rs1), fcvt_s_w),
+    "fcvt.s.wu": (lambda rd, rs1: enc_fcvt_s_wu(rd, rs1), fcvt_s_wu),
+}
+
+# FP to integer move (copy bits without conversion)
+# Note: Result goes to INTEGER register
+FP_MV_F2I: dict[str, tuple[Callable, Callable]] = {
+    "fmv.x.w": (lambda rd, rs1: enc_fmv_x_w(rd, rs1), fmv_x_w),
+}
+
+# Integer to FP move (copy bits without conversion)
+# Note: Source is INTEGER register, result goes to FP register
+FP_MV_I2F: dict[str, tuple[Callable, Callable]] = {
+    "fmv.w.x": (lambda rd, rs1: enc_fmv_w_x(rd, rs1), fmv_w_x),
+}
+
+# FP classify (FP operand -> integer bitmask result)
+# Note: Result goes to INTEGER register
+FP_CLASS: dict[str, tuple[Callable, Callable]] = {
+    "fclass.s": (lambda rd, rs1: enc_fclass_s(rd, rs1), fclass_s),
+}
+
+# FP load (memory -> FP register)
+# Format: (encoder, evaluator)
+#   encoder: lambda rd, rs1, imm -> 32-bit instruction
+#   evaluator: same as lw (loads 32 bits)
+FP_LOADS: dict[str, tuple[Callable, Callable]] = {
+    "flw": (lambda rd, rs1, imm: enc_flw(rd, rs1, imm), lw),
+}
+
+# FP store (FP register -> memory)
+# Format: encoder only (store has no return value)
+#   encoder: lambda rs2, rs1, imm -> 32-bit instruction
+FP_STORES: dict[str, Callable] = {
+    "fsw": lambda rs2, rs1, imm: enc_fsw(rs2, rs1, imm),
+}

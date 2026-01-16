@@ -2,7 +2,7 @@
 
 **F**PGA **R**ISC-V **O**pen-sourced in **S**ystemVerilog by **T**woSigma
 
-A 6-stage pipelined RISC-V processor implementing RV32IMACB with full machine-mode privilege support for RTOS operation. Achieves 322 MHz on UltraScale+. Designed for FPGA deployment with clean, portable SystemVerilog.
+A 6-stage pipelined RISC-V processor implementing RV32IMAFCB with full machine-mode privilege support for RTOS operation. Achieves 322 MHz on UltraScale+. Designed for FPGA deployment with clean, portable SystemVerilog.
 
 ## Why FROST?
 
@@ -10,7 +10,7 @@ There are many RISC-V cores. Here's what makes FROST different:
 
 - **Fully open-source toolchain** — works with Verilator, Icarus Verilog, and Yosys. No vendor lock-in or expensive commercial tools required.
 - **Clean, readable SystemVerilog** — not generated from Chisel or SpinalHDL. Every module is hand-written with extensive documentation, suitable for teaching, learning, and extending.
-- **Practical performance** — 1.63 CoreMark/MHz (526 CoreMark at 322 MHz on UltraScale+) with branch prediction (BTB + RAS), L0 cache, and full data forwarding.
+- **Practical performance** — 1.85 CoreMark/MHz (596 CoreMark at 322 MHz on UltraScale+) with branch prediction (BTB + RAS), L0 cache, and full data forwarding.
 - **Layered verification** — constrained-random tests, directed tests, and real C programs all run in Cocotb simulation with pass/fail markers. Bugs that slip past one layer get caught by another. More accessible than SystemVerilog/UVM.
 - **Real workloads included** — FreeRTOS demo, CoreMark benchmark, and ISA compliance suite all run in simulation and on hardware.
 - **No vendor primitives** — pure portable RTL that works on any target. Synthesis tested via Yosys for generic (ASIC), Xilinx 7-series, UltraScale, and UltraScale+. Board wrappers provided for Artix-7, Kintex-7, and UltraScale+.
@@ -60,15 +60,16 @@ There are many RISC-V cores. Here's what makes FROST different:
 
 ### Supported RISC-V Extensions
 
-**ISA: RV32IMACB** plus additional extensions — **140+ instructions**
+**ISA: RV32IMAFCB** plus additional extensions — **170+ instructions**
 
 | Extension        | Description                                    |
 |------------------|------------------------------------------------|
 | **RV32I**        | Base integer instruction set (37 instructions) |
 | **M**            | Integer multiply/divide                        |
 | **A**            | Atomic memory operations (LR/SC, AMO)          |
-| **B**            | Bit manipulation (B = Zba + Zbb + Zbs)         |
+| **F**            | Single-precision floating-point (32-bit)       |
 | **C**            | Compressed instructions (16-bit encodings)     |
+| **B**            | Bit manipulation (B = Zba + Zbb + Zbs)         |
 | **Zicsr**        | CSR access instructions                        |
 | **Zicntr**       | Base counters (cycle, time, instret)           |
 | **Zifencei**     | Instruction fence                              |
@@ -281,6 +282,65 @@ Running `pytest tests/` exercises:
 | Digilent Genesys2  | Kintex-7 (xc7k325t)  | 133 MHz   |
 | Digilent Nexys A7  | Artix-7 (xc7a100t)   | 80 MHz    |
 
+
+<!-- FPGA_UTILIZATION_START -->
+
+### FPGA Resource Utilization
+
+**Alveo X3522PV** (Virtex UltraScale+ @ 322 MHz)
+
+| Resource | Used | Available | Util% |
+|----------|-----:|----------:|------:|
+| CLB LUTs | 16,462 | 1,029,600 | 1.6% |
+|   LUT as Logic | 15,155 | 1,029,600 | 1.5% |
+|   LUT as Distributed RAM | 1,211 | — | — |
+|   LUT as Shift Register | 96 | — | — |
+| CLB Registers | 9,686 | 2,059,200 | 0.5% |
+| Block RAM Tile | 21.5 | 2,112 | 1.0% |
+| URAM | 0 | 352 | 0.0% |
+| DSPs | 8 | 1,320 | 0.6% |
+| CARRY8 | 437 | 128,700 | 0.3% |
+| F7 Muxes | 8 | 514,800 | 0.0% |
+| F8 Muxes | 0 | 257,400 | 0.0% |
+| Bonded IOB | 4 | 364 | 1.1% |
+| MMCM | 1 | 11 | 9.1% |
+| PLL | 0 | 22 | 0.0% |
+
+**Digilent Genesys2** (Kintex-7 @ 133 MHz)
+
+| Resource | Used | Available | Util% |
+|----------|-----:|----------:|------:|
+| Slice LUTs | 15,311 | 203,800 | 7.5% |
+|   LUT as Logic | 13,954 | 203,800 | 6.8% |
+|   LUT as Distributed RAM | 1,261 | — | — |
+|   LUT as Shift Register | 96 | — | — |
+| Slice Registers | 9,571 | 407,600 | 2.4% |
+| Block RAM Tile | 21.5 | 445 | 4.8% |
+| DSPs | 8 | 840 | 0.9% |
+| F7 Muxes | 8 | 101,900 | 0.0% |
+| F8 Muxes | 0 | 50,950 | 0.0% |
+| Bonded IOB | 6 | 500 | 1.2% |
+| MMCM | 1 | 10 | 10.0% |
+| PLL | 0 | 10 | 0.0% |
+
+**Digilent Nexys A7** (Artix-7 @ 80 MHz)
+
+| Resource | Used | Available | Util% |
+|----------|-----:|----------:|------:|
+| Slice LUTs | 15,192 | 63,400 | 24.0% |
+|   LUT as Logic | 13,835 | 63,400 | 21.8% |
+|   LUT as Distributed RAM | 1,261 | — | — |
+|   LUT as Shift Register | 96 | — | — |
+| Slice Registers | 9,569 | 126,800 | 7.5% |
+| Block RAM Tile | 21.5 | 135 | 15.9% |
+| DSPs | 8 | 240 | 3.3% |
+| F7 Muxes | 8 | 31,700 | 0.0% |
+| F8 Muxes | 0 | 15,850 | 0.0% |
+| Bonded IOB | 4 | 210 | 1.9% |
+| MMCM | 1 | 6 | 16.7% |
+| PLL | 0 | 6 | 0.0% |
+
+<!-- FPGA_UTILIZATION_END -->
 ## Roadmap
 
 ### To-Do
@@ -291,7 +351,7 @@ Running `pytest tests/` exercises:
 - [ ] Out-of-order execution
 
 ### ISA Roadmap
-- [ ] F extension — single-precision floating-point
+- [x] F extension — single-precision floating-point
 - [ ] D extension — double-precision floating-point
 
 ## Glossary
@@ -303,6 +363,7 @@ Running `pytest tests/` exercises:
 | **A extension** | Atomic memory operations (LR/SC, AMO)            |
 | **B extension** | Bit manipulation (Zba + Zbb + Zbs)               |
 | **C extension** | Compressed 16-bit instructions                   |
+| **F extension** | Single-precision floating-point (32-bit IEEE 754)|
 | **IF**          | Instruction Fetch stage                          |
 | **PD**          | Pre-Decode stage (C extension decompression)     |
 | **ID**          | Instruction Decode stage                         |
