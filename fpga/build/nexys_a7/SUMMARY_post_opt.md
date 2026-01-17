@@ -9,7 +9,7 @@
 | WNS (Setup) | 2.459 ns |
 | TNS (Setup) | 0.000 ns (0 failing) |
 | WHS (Hold) | -0.107 ns |
-| THS (Hold) | -5.722 ns (73 failing) |
+| THS (Hold) | -5.720 ns (73 failing) |
 | Timing Met | No |
 
 ## Worst Setup Path
@@ -31,7 +31,7 @@
 
 | Resource | Used | Available | Util% |
 |----------|------|-----------|-------|
-| LUTs | 9445 | 63400 | 14.90% |
+| LUTs | 9450 | 63400 | 14.91% |
 | Registers | 5841 | 126800 | 4.61% |
 | Block RAM | 21.5 | 135 | 15.93% |
 | DSPs | 4 | 240 | 1.67% |

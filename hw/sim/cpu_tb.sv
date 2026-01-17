@@ -32,7 +32,8 @@ module cpu_tb
     // Data memory interface
     output logic [31:0] o_data_mem_addr,
     output logic [31:0] o_data_mem_wr_data,
-    output logic [ 3:0] o_data_mem_per_byte_wr_en,
+    output logic [3:0] o_data_mem_per_byte_wr_en,
+    output logic o_data_mem_read_enable,
 
     // Control signals
     output logic o_rst_done,  // Reset sequence complete

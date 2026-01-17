@@ -105,16 +105,20 @@ static uint32_t extract_client_order_id(uint64_t mapped_order_id)
 }
 
 /* Read a string from FIFO (simplified version for embedded system) */
+static inline uint32_t fifo_read_word(int fifo_id)
+{
+    uint32_t chunk = (fifo_id == 0) ? fifo0_read() : fifo1_read();
+    /* Give MMIO read data a cycle to settle before consumption. */
+    asm volatile("nop");
+    return chunk;
+}
+
 static bool read_string_from_fifo(int fifo_id, string_buffer_t *str)
 {
     uint32_t chunk;
 
     /* Read first chunk to get length */
-    if (fifo_id == 0) {
-        chunk = fifo0_read();
-    } else {
-        chunk = fifo1_read();
-    }
+    chunk = fifo_read_word(fifo_id);
 
     uint8_t len = chunk & 0xFF;
     if (len == 0) {
@@ -137,11 +141,7 @@ static bool read_string_from_fifo(int fifo_id, string_buffer_t *str)
 
     /* Read additional chunks as needed */
     while (idx < len) {
-        if (fifo_id == 0) {
-            chunk = fifo0_read();
-        } else {
-            chunk = fifo1_read();
-        }
+        chunk = fifo_read_word(fifo_id);
 
         for (int i = 0; i < 4 && idx < len; i++) {
             str->data[idx++] = (chunk >> (i * 8)) & 0xFF;
@@ -154,10 +154,26 @@ static bool read_string_from_fifo(int fifo_id, string_buffer_t *str)
 
 
 /* Parse venue accepted message */
-static bink_v1_venue_accepted_t parse_venue_accepted(void)
+static void drain_fifo_pairs(void)
+{
+    string_buffer_t key_buf, val_buf;
+
+    for (int i = 0; i < 128; i++) {
+        bool has_key = read_string_from_fifo(0, &key_buf);
+        bool has_val = read_string_from_fifo(1, &val_buf);
+
+        if (!has_key && !has_val) {
+            return;
+        }
+    }
+}
+
+static bink_v1_venue_accepted_t parse_venue_accepted(bool *ok, bool *fix_version_ok)
 {
     bink_v1_venue_accepted_t msg;
     string_buffer_t key_buf, val_buf;
+    bool success = true;
+    bool fix_ok = true;
 
     /* Initialize message */
     memset(&msg, 0, sizeof(msg));
@@ -170,7 +186,7 @@ static bink_v1_venue_accepted_t parse_venue_accepted(void)
 
         /* Should be in sync */
         if (has_key != has_val) {
-            uart_printf("ERROR: FIFO mismatch\n");
+            success = false;
             break;
         }
 
@@ -184,7 +200,7 @@ static bink_v1_venue_accepted_t parse_venue_accepted(void)
             case FIX_TAG_BEGIN_STRING:
                 /* Verify FIX version */
                 if (strcmp(val_buf.data, "FIX.4.2") != 0) {
-                    uart_printf("Warning: Expected FIX.4.2\n");
+                    fix_ok = false;
                 }
                 break;
 
@@ -242,6 +258,12 @@ static bink_v1_venue_accepted_t parse_venue_accepted(void)
         }
     }
 
+    if (ok) {
+        *ok = success;
+    }
+    if (fix_version_ok) {
+        *fix_version_ok = fix_ok;
+    }
     return msg;
 }
 
@@ -339,28 +361,34 @@ int main(void)
 {
     uint32_t start_time, end_time;
 
-    uart_printf("\n=== FROST Packet Parser - Full Bink Message ===\n");
-
-    /* Clear FIFOs */
-    for (int i = 0; i < 10; i++) {
-        fifo0_read();
-        fifo1_read();
-    }
+    /* Drain any leftover data so we start at a message boundary. */
+    drain_fifo_pairs();
 
     /* Fill FIFOs with FIX message */
-    uart_printf("Writing FIX message to FIFOs...\n");
     fill_fifos_with_fix_message();
+    delay_ticks(1000);
 
     /* Start timing */
     start_time = read_timer();
 
     /* Parse the message */
-    bink_v1_venue_accepted_t msg = parse_venue_accepted();
+    bool parse_ok = true;
+    bool fix_version_ok = true;
+    bink_v1_venue_accepted_t msg = parse_venue_accepted(&parse_ok, &fix_version_ok);
 
     /* End timing */
     end_time = read_timer();
 
     /* Print results */
+    uart_printf("\n=== FROST Packet Parser - Full Bink Message ===\n");
+    uart_printf("Writing FIX message to FIFOs...\n");
+    if (!fix_version_ok) {
+        uart_printf("Warning: Expected FIX.4.2\n");
+    }
+    if (!parse_ok) {
+        uart_printf("ERROR: FIFO mismatch\n");
+    }
+
     uart_printf("\n=== Parsed Bink Venue Accepted Message ===\n");
     uart_printf("header.len: %u\n", msg.msg_header.len);
     uart_printf("header.msg_type: %u\n", msg.msg_header.msg_type);
@@ -387,7 +415,11 @@ int main(void)
                 (end_time - start_time) * CLOCK_PERIOD_PS / 1000);
 
     uart_printf("\n=== Test Complete ===\n");
-    uart_printf("<<PASS>>\n");
+    if (parse_ok) {
+        uart_printf("<<PASS>>\n");
+    } else {
+        uart_printf("<<FAIL>>\n");
+    }
 
     /* Halt */
     for (;;) {

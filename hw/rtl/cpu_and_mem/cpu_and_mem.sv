@@ -103,6 +103,7 @@ module cpu_and_mem #(
   logic                  [31:0] data_memory_read_data;  // From RAM only
   logic                  [31:0] data_memory_address_registered;  // Delayed for read data alignment
   logic                  [ 3:0] data_memory_byte_write_enable;
+  logic                         data_memory_read_enable;
 
   // Timer registers (CLINT-style)
   logic                  [63:0] mtime;  // Machine time counter
@@ -138,6 +139,7 @@ module cpu_and_mem #(
       .o_data_mem_addr(data_memory_address),
       .o_data_mem_wr_data(data_memory_write_data),
       .o_data_mem_per_byte_wr_en(data_memory_byte_write_enable),
+      .o_data_mem_read_enable(data_memory_read_enable),
       .i_data_mem_rd_data(data_memory_or_peripheral_read_data),
       .o_rst_done(/*not connected*/),
       .o_vld   (/*not connected*/),
@@ -220,17 +222,16 @@ module cpu_and_mem #(
   assign o_fifo1_wr_en   = |data_memory_byte_write_enable_registered &&
                             data_memory_address_registered == Fifo1MmioAddr;
 
-  // FIFO read enable generation - pulses when reading from FIFO addresses
-  // Uses delayed write enable to distinguish reads (write_enable=0) from writes
+  // FIFO read enable generation - pulses only for load instructions
   assign o_fifo0_rd_en = (data_memory_address_registered == Fifo0MmioAddr) &&
-                         (data_memory_byte_write_enable_registered == 4'b0000);
+                         data_memory_read_enable;
   assign o_fifo1_rd_en = (data_memory_address_registered == Fifo1MmioAddr) &&
-                         (data_memory_byte_write_enable_registered == 4'b0000);
+                         data_memory_read_enable;
 
-  // UART RX ready generation - pulses when reading from UART RX data address
+  // UART RX ready generation - pulses on load from UART RX data address
   // This consumes the byte from the RX FIFO
   assign o_uart_rx_ready = (data_memory_address_registered == UartRxDataMmioAddr) &&
-                           (data_memory_byte_write_enable_registered == 4'b0000);
+                           data_memory_read_enable;
 
   // Timer register updates
   // mtime increments every clock cycle (provides wall-clock time)

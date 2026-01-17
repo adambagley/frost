@@ -131,6 +131,7 @@ module cpu #(
     output logic [XLEN-1:0] o_data_mem_addr,
     output logic [XLEN-1:0] o_data_mem_wr_data,
     output logic [3:0] o_data_mem_per_byte_wr_en,
+    output logic o_data_mem_read_enable,
     // reset sequence (due to cache LUTRAM clear) finished
     output logic o_rst_done,
     // these indicate output is valid. useful for testbench
@@ -295,6 +296,8 @@ module cpu #(
   assign o_data_mem_per_byte_wr_en = amo.write_enable ? 4'b1111 :
                                      (from_ex_comb.data_memory_byte_write_enable &
                                       {4{~pipeline_ctrl.stall_for_trap_check}});
+  assign o_data_mem_read_enable = (from_ex_to_ma.is_load_instruction | from_ex_to_ma.is_lr) &
+                                  ~pipeline_ctrl.stall;
 
   /*
     Stage 5: Memory Access (MA)
