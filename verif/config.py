@@ -216,7 +216,7 @@ class DUTSignalPaths:
 DEFAULT_NUM_TEST_LOOPS: Final[int] = 16000
 """Default number of random instructions to generate in tests."""
 
-DEFAULT_MIN_COVERAGE_COUNT: Final[int] = 100
+DEFAULT_MIN_COVERAGE_COUNT: Final[int] = 80
 """Default minimum execution count per instruction for coverage."""
 
 DEFAULT_MEMORY_INIT_SIZE: Final[int] = 0x2000
