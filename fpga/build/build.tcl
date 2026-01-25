@@ -15,15 +15,24 @@
 # Vivado build script for FROST RISC-V processor
 # Synthesizes, implements, and generates bitstream for specified FPGA board
 
-# Validate command line arguments - require board name, synth_only flag, and retiming flag
-if {$argc != 3} {
+# Validate command line arguments
+# Required: board_name, synth_only, retiming
+# Optional: opt_only (stop after opt_design, for generating shared checkpoint)
+#           placer_directive (default: AltSpreadLogic_high)
+#           checkpoint_path (if provided, skip synthesis and load this checkpoint)
+#           work_suffix (suffix for work directory, used for parallel runs)
+if {$argc < 3} {
     puts "Error: Board name, synth_only flag, and retiming flag are required"
-    puts "Usage: vivado -mode batch -source build.tcl -tclargs <board_name> <synth_only> <retiming>"
+    puts "Usage: vivado -mode batch -source build.tcl -tclargs <board_name> <synth_only> <retiming> \[opt_only\] \[placer_directive\] \[checkpoint_path\] \[work_suffix\]"
     exit 1
 }
 set board_name [lindex $argv 0]
 set synth_only [lindex $argv 1]
 set retiming [lindex $argv 2]
+set opt_only [expr {$argc > 3 ? [lindex $argv 3] : "0"}]
+set placer_directive [expr {$argc > 4 ? [lindex $argv 4] : "ExtraTimingOpt"}]
+set checkpoint_path [expr {$argc > 5 ? [lindex $argv 5] : ""}]
+set work_suffix [expr {$argc > 6 ? [lindex $argv 6] : ""}]
 if {$board_name ne "x3" && $board_name ne "genesys2" && $board_name ne "nexys_a7"} {
     puts "Error: Invalid board name '$board_name'"
     puts "Valid boards: x3, genesys2, nexys_a7"
@@ -54,7 +63,12 @@ set number_of_parallel_jobs 32
 # Navigate up 5 levels to reach project root:
 #   build.tcl -> build/ -> fpga/ -> frost/ -> src/ -> <project_root>
 set script_directory [file dirname [file normalize [info script]]]
-set work_directory   [file join $script_directory $board_name work]
+# Work directory can have a suffix for parallel sweep runs (e.g., work_Explore, work_Default)
+if {$work_suffix ne ""} {
+    set work_directory [file join $script_directory $board_name "work_${work_suffix}"]
+} else {
+    set work_directory [file join $script_directory $board_name work]
+}
 set project_root_directory [file dirname $script_directory/../../../]
 set board_specific_directory [file join $project_root_directory boards/$board_name]
 set rtl_file_list [file join $board_specific_directory ${board_name}_frost.f]
@@ -63,16 +77,27 @@ set constraints_file [file join $board_specific_directory constr/${board_name}.x
 puts "Board: $board_name"
 puts "FPGA Part: $fpga_part_number"
 puts "Top Module: $top_level_module_name"
+puts "Placer Directive: $placer_directive"
 puts "Script directory: $script_directory"
+puts "Work directory: $work_directory"
 puts "Project root: $project_root_directory"
 puts "Board files: $board_specific_directory"
+if {$checkpoint_path ne ""} {
+    puts "Starting from checkpoint: $checkpoint_path"
+}
 
 # Create work directory if it doesn't exist
 if {![file isdirectory $work_directory]} {
     file mkdir $work_directory
 }
 
-# Recursively read file list and expand any nested file lists
+# If starting from a checkpoint, load it and skip synthesis
+if {$checkpoint_path ne ""} {
+    puts "Loading checkpoint: $checkpoint_path"
+    open_checkpoint $checkpoint_path
+} else {
+    # Full synthesis flow follows
+    # Recursively read file list and expand any nested file lists
 # Transforms hierarchical .f file structure into flat list of RTL files for Vivado
 proc flatten_rtl_file_list {file_list_path project_root} {
     set rtl_files_list {}
@@ -169,9 +194,18 @@ write_checkpoint -force $work_directory/post_opt.dcp
 report_timing_summary -file $work_directory/post_opt_timing.rpt
 report_utilization    -file $work_directory/post_opt_util.rpt
 
+if {$opt_only eq "1"} {
+    puts "** DONE — opt_design only, checkpoint at $work_directory/post_opt.dcp"
+    exit
+}
+
+}
+# End of synthesis/opt block - from here on, we either came from checkpoint or fresh synthesis
+
 # apply overconstraining during placer for better placement
 set_clock_uncertainty -from clock_from_mmcm -to clock_from_mmcm 1.0 -setup
-place_design -directive ExtraNetDelay_high
+place_design -directive $placer_directive
+puts "** Placer completed with directive: $placer_directive"
 phys_opt_design -directive AggressiveExplore
 write_checkpoint -force $work_directory/post_place.dcp
 report_timing_summary -file $work_directory/post_place_timing.rpt

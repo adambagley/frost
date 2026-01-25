@@ -11,8 +11,9 @@ This directory contains the complete infrastructure for building, programming, a
 │                                                                             │
 │   ┌──────────────┐     ┌──────────────────┐     ┌───────────────────────┐   │
 │   │  RTL Source  │────>│  build/build.py  │────>│  Bitstream (.bit)     │   │
-│   │  (hw/rtl/)   │     │  (~15-30 min)    │     │  (build/<board>/work/)│   │
-│   └──────────────┘     └──────────────────┘     └───────────┬───────────┘   │
+│   │  (hw/rtl/)   │     │       -or-       │     │  (build/<board>/work/)│   │
+│   └──────────────┘     │  build_sweep.py  │     └───────────┬───────────┘   │
+│                        └──────────────────┘                 │               │
 │                                                             │               │
 │                                                             v               │
 │                                              ┌──────────────────────────┐   │
@@ -113,6 +114,47 @@ The build system uses Vivado in batch mode to synthesize, place, and route the d
 # Full build with global retiming enabled
 ./fpga/build/build.py x3 --retiming
 ```
+
+### Placer Directive Sweep
+
+For the X3 target (322 MHz), timing closure can be challenging and results vary significantly between different placer directives. The `build_sweep.py` script runs multiple place+route jobs in parallel with different directives and automatically selects the first one that passes timing.
+
+```bash
+./fpga/build/build_sweep.py [--skip-synth-opt] [--auto] [--keep-all]
+```
+
+**How it works:**
+1. Runs synthesis and opt_design once (shared across all runs)
+2. Launches 12 parallel Vivado place+route jobs, each with a different placer directive
+3. As soon as any run passes timing, kills all remaining jobs and uses that result
+4. If no run passes timing, selects the result with the best WNS
+
+**Arguments:**
+- `--skip-synth-opt` - Skip synthesis/opt and reuse existing `post_opt.dcp` checkpoint (for re-running sweeps)
+- `--auto` - Include ML-predicted Auto_1/2/3 directives (15 total jobs)
+- `--all` - Include SSI-specific directives (19 total jobs, only useful for stacked silicon devices)
+- `--keep-all` - Keep all work directories instead of cleaning up non-winners
+- `--retiming` - Enable global retiming during synthesis
+
+**Examples:**
+```bash
+# Full sweep (synthesis + 12 parallel place+route jobs)
+./fpga/build/build_sweep.py
+
+# Re-run sweep from existing synthesis checkpoint
+./fpga/build/build_sweep.py --skip-synth-opt
+
+# Include ML-predicted directives
+./fpga/build/build_sweep.py --auto
+```
+
+**Default directives tested:**
+- Default, Explore, WLDrivenBlockPlacement, EarlyBlockPlacement
+- ExtraNetDelay_high, ExtraNetDelay_low
+- AltSpreadLogic_high, AltSpreadLogic_medium, AltSpreadLogic_low
+- ExtraPostPlacementOpt, ExtraTimingOpt, RuntimeOptimized
+
+Results are printed in a table showing WNS/TNS for each directive, with the winner copied to the main `work/` directory.
 
 ## Programming the FPGA
 
@@ -282,7 +324,7 @@ The build system uses aggressive optimization settings for maximum frequency:
 | Synthesis    | `AlternateRoutability`      | Prevent local congestion                                            |
 | Synthesis    | `global_retiming on`        | Move registers across logic for timing (optional, via `--retiming`) |
 | Optimization | `ExploreWithRemap`          | LUT optimization                                                    |
-| Placement    | `ExtraNetDelay_high`        | Conservative placement for timing                                   |
+| Placement    | (varies)                    | `build.py`: AltSpreadLogic_high; `build_sweep.py`: tries 12+ directives |
 | Routing      | `AggressiveExplore`         | Maximum routing effort                                              |
 | Routing      | `AlternateFlowWithRetiming` | Enable retiming optimizations                                       |
 
@@ -326,6 +368,7 @@ The build system uses aggressive optimization settings for maximum frequency:
 - Use `--target <pattern>` to select the correct board by index, vendor, or serial number
 
 **Timing failures**
+- Use `build_sweep.py` to try multiple placer directives in parallel
 - Check `build/<board>/work/post_route_timing.rpt` for failing paths
 - Consider reducing clock frequency in the board's constraint file
 

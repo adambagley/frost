@@ -121,6 +121,11 @@ def main() -> None:
         default="vivado",
         help="Path to Vivado executable (default: vivado from PATH)",
     )
+    parser.add_argument(
+        "--placer-directive",
+        default="AltSpreadLogic_high",
+        help="Placer directive to use (default: AltSpreadLogic_high)",
+    )
     args = parser.parse_args()
 
     board_name = args.board_name
@@ -154,6 +159,10 @@ def main() -> None:
         board_name,
         "1" if args.synth_only else "0",
         "1" if args.retiming else "0",
+        "0",  # opt_only (always 0 for regular builds)
+        args.placer_directive,
+        "",  # checkpoint_path (none - full build)
+        "",  # work_suffix (none - use default work directory)
     ]
 
     # Execute Vivado build (will raise exception on failure)
